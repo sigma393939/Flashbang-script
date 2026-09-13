@@ -1,0 +1,2 @@
+# Flashbang-script
+W BUNDLE
