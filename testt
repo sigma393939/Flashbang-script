@@ -1,5 +1,5 @@
 -- ══════════════════════════════════════════════════════════
--- REPLAY MOD v16
+-- REPLAY MOD v16.1
 -- Fixed save (NaN sanization) | Exact freecam | Click + F
 -- LocalScript → StarterPlayer > StarterPlayerScripts
 -- v16: saved client UI snapshots + replay UI toggle + respawn appearance refresh
@@ -3238,6 +3238,7 @@ closeBtn.MouseButton1Click:Connect(function()
     pcall(showSelfChar)
     pcall(function() gui.Enabled = false end)
 end)
+
 for n, c in pairs(tabContents) do c.Visible = (n == "Record") end
 for n, b in pairs(tabs) do
     b.BackgroundColor3 = (n == "Record") and COL.accent or COL.panel
@@ -3255,5 +3256,5 @@ end)
 
 ensureFolder()
 refreshFileList()
-setStatus("Ready — R record • P studio • Space pause • Alt cursor • Shift+P freecam • v15.2 stable", COL.good)
-print("[REPLAY MOD v15.2 Stable] Loaded. Save folder: " .. REPLAY_FOLDER)
+setStatus("Ready — R record • P studio • Space pause • Alt cursor • Shift+P freecam • v16.1 stable", COL.good)
+print("[REPLAY MOD v16.1] Loaded. Save folder: " .. REPLAY_FOLDER)
