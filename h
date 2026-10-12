@@ -1,0 +1,3260 @@
+-- ══════════════════════════════════════════════════════════
+-- REPLAY MOD v16.1
+-- Fixed save (NaN sanization) | Exact freecam | Click + F
+-- LocalScript → StarterPlayer > StarterPlayerScripts
+-- v16: saved client UI snapshots + replay UI toggle + respawn appearance refresh
+-- ══════════════════════════════════════════════════════════
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
+local MarketplaceSvc   = game:GetService("MarketplaceService")
+local Camera           = workspace.CurrentCamera
+local player           = Players.LocalPlayer
+
+local REPLAY_FOLDER = "logs"
+local RECORD_RATE   = 1/30
+local FILE_VERSION  = 16
+local LOAD_TIMEOUT  = 15
+
+-- ══════════════════════════════════════════════════════════
+-- STATE
+-- ══════════════════════════════════════════════════════════
+local isRecording, isPlaying, isPaused = false, false, false
+local currentReplay = nil
+local recordedPlayers, recordedRigTypes = {}, {}
+local recordedAppearances = {}
+local recordedAppearanceEvents = {}
+local appliedAppearanceEventIndex = {}
+local appearanceReloading = {}
+local applyAppearanceEventsAt
+local recordedAvatarClones = {}
+local recordedLocalCamera = {}
+local recordedMapSnapshot = nil
+local recordedUISnapshots = {}
+local replayUIOverlay = nil
+local replayUIEnabled = true
+local savedScreenGuiStates = {}
+local lastUISnapshotTime = -1
+local lastRespawnTime = {}
+local replayHiddenWorldParts = {}
+local lastKnown = {}
+local replayCharacters, replayAnimTracks = {}, {}
+local hiddenPlayers = {}
+local recStartTime, lastRecTime = 0, 0
+local replayTime, replaySpeed = 0, 1
+local realHidden = false
+local currentPlaceInfo = nil
+local uiHidden = false
+local hideSelfEnabled = false
+local useGameplayMap = true -- true = keep the real game map/baseplate; false = use saved replay map snapshot
+local replayCursorUnlocked = false
+local replaySavedMouseBehavior = nil
+local replaySavedMouseIcon = nil
+
+local selectedHumanoid = nil
+local selectionHighlight = nil
+local spectating = false
+local savedCameraType, savedCameraSubject
+
+-- ══════════════════════════════════════════════════════════
+-- HELPERS
+-- ══════════════════════════════════════════════════════════
+local function new(class, props, children)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do
+        if k ~= "Parent" then inst[k] = v end
+    end
+    for _, c in ipairs(children or {}) do c.Parent = inst end
+    if props and props.Parent then inst.Parent = props.Parent end
+    return inst
+end
+local function corner(r, p) return new("UICorner", {CornerRadius = UDim.new(0, r or 6), Parent = p}) end
+local function stroke(c, t, p) return new("UIStroke", {Color = c or Color3.fromRGB(70,70,100), Thickness = t or 1, Parent = p}) end
+local function pad(n, p) return new("UIPadding", {PaddingTop=UDim.new(0,n),PaddingBottom=UDim.new(0,n),PaddingLeft=UDim.new(0,n),PaddingRight=UDim.new(0,n),Parent=p}) end
+
+local function fsHas()     return type(writefile) == "function" end
+local function canRead()   return type(readfile) == "function" end
+local function canList()   return type(listfiles) == "function" end
+local function canDelete() return type(delfile) == "function" end
+
+local function ensureFolder()
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        if not isfolder(REPLAY_FOLDER) then pcall(makefolder, REPLAY_FOLDER) end
+    end
+end
+
+local function fmtTime(s)
+    if not s or s < 0 then s = 0 end
+    local mins = math.floor(s / 60)
+    return string.format("%d:%04.1f", mins, s - mins * 60)
+end
+
+local function getPlaceName()
+    local ok, info = pcall(function() return MarketplaceSvc:GetProductInfo(game.PlaceId) end)
+    if ok and info then return info.Name end
+    return "Place " .. tostring(game.PlaceId)
+end
+
+local function getRigType(char)
+    if char:FindFirstChild("UpperTorso") then return Enum.HumanoidRigType.R15 end
+    return Enum.HumanoidRigType.R6
+end
+
+-- ══════════════════════════════════════════════════════════
+-- SAFE NUMBER / CFrame SERIALIZATION (fixes the "X axis" error)
+-- ══════════════════════════════════════════════════════════
+local function sanitizeNumber(n)
+    if type(n) ~= "number" then return 0 end
+    if n ~= n then return 0 end                    -- NaN
+    if n == math.huge or n == -math.huge then return 0 end
+    -- clamp to sane range & round to 4 decimals
+    if n > 1e9 then n = 1e9 elseif n < -1e9 then n = -1e9 end
+    return math.floor(n * 10000 + 0.5) / 10000
+end
+
+local function safeVec(v)
+    if not v then return {0,0,0} end
+    if typeof(v) == "Vector3" then
+        return {sanitizeNumber(v.X), sanitizeNumber(v.Y), sanitizeNumber(v.Z)}
+    end
+    if type(v) == "table" then
+        return {sanitizeNumber(v[1] or v.X or 0), sanitizeNumber(v[2] or v.Y or 0), sanitizeNumber(v[3] or v.Z or 0)}
+    end
+    return {0,0,0}
+end
+
+local function safeCFrameComponents(cf)
+    -- IMPORTANT:
+    -- Do not use CFrame.XAxis/YAxis/ZAxis here. Some Roblox/executor
+    -- environments expose CFrame but do not expose those properties.
+    -- GetComponents() is much more compatible and directly gives all 12
+    -- CFrame components needed to rebuild the exact rotation.
+    if typeof(cf) == "CFrame" then
+        local ok, x,y,z,r00,r01,r02,r10,r11,r12,r20,r21,r22 = pcall(function()
+            return cf:GetComponents()
+        end)
+        if ok then
+            return {
+                x = sanitizeNumber(x), y = sanitizeNumber(y), z = sanitizeNumber(z),
+                r00 = sanitizeNumber(r00), r01 = sanitizeNumber(r01), r02 = sanitizeNumber(r02),
+                r10 = sanitizeNumber(r10), r11 = sanitizeNumber(r11), r12 = sanitizeNumber(r12),
+                r20 = sanitizeNumber(r20), r21 = sanitizeNumber(r21), r22 = sanitizeNumber(r22),
+            }
+        end
+    end
+
+    if type(cf) == "table" then
+        -- v11 format
+        if cf.r00 ~= nil then
+            return {
+                x = sanitizeNumber(cf.x), y = sanitizeNumber(cf.y), z = sanitizeNumber(cf.z),
+                r00 = sanitizeNumber(cf.r00), r01 = sanitizeNumber(cf.r01), r02 = sanitizeNumber(cf.r02),
+                r10 = sanitizeNumber(cf.r10), r11 = sanitizeNumber(cf.r11), r12 = sanitizeNumber(cf.r12),
+                r20 = sanitizeNumber(cf.r20), r21 = sanitizeNumber(cf.r21), r22 = sanitizeNumber(cf.r22),
+            }
+        end
+
+        -- v10 compatibility
+        if cf.a and cf.b and cf.c then
+            local a,b,c = safeVec(cf.a), safeVec(cf.b), safeVec(cf.c)
+            return {
+                x=0,y=0,z=0,
+                r00=a[1], r01=a[2], r02=a[3],
+                r10=b[1], r11=b[2], r12=b[3],
+                r20=c[1], r21=c[2], r22=c[3],
+            }
+        end
+    end
+
+    return {
+        x=0,y=0,z=0,
+        r00=1,r01=0,r02=0,
+        r10=0,r11=1,r12=0,
+        r20=0,r21=0,r22=1,
+    }
+end
+
+local function cframeFromSerialized(c)
+    if type(c) ~= "table" then return CFrame.new() end
+
+    -- v11 format
+    if c.r00 ~= nil then
+        local ok, cf = pcall(function()
+            return CFrame.new(
+                tonumber(c.x) or 0, tonumber(c.y) or 0, tonumber(c.z) or 0,
+                tonumber(c.r00) or 1, tonumber(c.r01) or 0, tonumber(c.r02) or 0,
+                tonumber(c.r10) or 0, tonumber(c.r11) or 1, tonumber(c.r12) or 0,
+                tonumber(c.r20) or 0, tonumber(c.r21) or 0, tonumber(c.r22) or 1
+            )
+        end)
+        if ok and cf then return cf end
+    end
+
+    -- v10 compatibility
+    if c.xa and c.ya and c.za then
+        local ok, cf = pcall(function()
+            local pos = Vector3.new(tonumber(c.x) or 0, tonumber(c.y) or 0, tonumber(c.z) or 0)
+            local a = Vector3.new(tonumber(c.xa[1]) or 1, tonumber(c.xa[2]) or 0, tonumber(c.xa[3]) or 0)
+            local b = Vector3.new(tonumber(c.ya[1]) or 0, tonumber(c.ya[2]) or 1, tonumber(c.ya[3]) or 0)
+            local d = Vector3.new(tonumber(c.za[1]) or 0, tonumber(c.za[2]) or 0, tonumber(c.za[3]) or 1)
+            return CFrame.new(pos, pos + a) -- fallback below if constructor differs
+        end)
+        if ok and cf then
+            -- Rebuild using the old matrix representation when possible.
+            local ok2, exact = pcall(function()
+                return CFrame.fromMatrix(
+                    Vector3.new(tonumber(c.x) or 0, tonumber(c.y) or 0, tonumber(c.z) or 0),
+                    Vector3.new(tonumber(c.xa[1]) or 1, tonumber(c.xa[2]) or 0, tonumber(c.xa[3]) or 0),
+                    Vector3.new(tonumber(c.ya[1]) or 0, tonumber(c.ya[2]) or 1, tonumber(c.ya[3]) or 0),
+                    Vector3.new(tonumber(c.za[1]) or 0, tonumber(c.za[2]) or 0, tonumber(c.za[3]) or 1)
+                )
+            end)
+            if ok2 and exact then return exact end
+            return cf
+        end
+    end
+
+    return CFrame.new()
+end
+
+local function safePosition(p)
+    if not p then return {x=0, y=0, z=0} end
+    if type(p) == "Vector3" then
+        return {x=sanitizeNumber(p.X), y=sanitizeNumber(p.Y), z=sanitizeNumber(p.Z)}
+    end
+    if type(p) == "table" then
+        return {x=sanitizeNumber(p.x or p.X or 0), y=sanitizeNumber(p.y or p.Y or 0), z=sanitizeNumber(p.z or p.Z or 0)}
+    end
+    return {x=0, y=0, z=0}
+end
+
+-- ══════════════════════════════════════════════════════════
+-- AVATAR APPEARANCE SNAPSHOT
+--
+-- A replay must not depend on the player's avatar at playback time.
+-- If somebody died/left the server, there may be no Character to clone.
+-- We therefore save a compact HumanoidDescription snapshot while recording
+-- and rebuild the same avatar (including hats/accessories/clothes) later.
+-- ══════════════════════════════════════════════════════════
+local DESCRIPTION_STRING_PROPS = {
+    "BackAccessory", "BodyTypeScale", "ClimbAnimation", "DepthScale", "Face",
+    "FaceAccessory", "FallAnimation", "FrontAccessory", "GraphicTShirt",
+    "HairAccessory", "Head", "HeadColor", "HeadScale", "HeightScale",
+    "IdleAnimation", "JumpAnimation", "LeftArm", "LeftArmColor", "LeftLeg",
+    "LeftLegColor", "NeckAccessory", "Pants", "ProportionScale", "RightArm",
+    "RightArmColor", "RightLeg", "RightLegColor", "RunAnimation", "Shirt",
+    "ShoulderAccessory", "SwimAnimation", "Torso", "TorsoColor", "WaistAccessory",
+    "WalkAnimation", "WidthScale", "HatAccessory", "EmotesData", "MoodAnimation"
+}
+
+local DESCRIPTION_PROPS = {
+    "BackAccessory", "ClimbAnimation", "DepthScale", "Face", "FaceAccessory",
+    "FallAnimation", "FrontAccessory", "GraphicTShirt", "HairAccessory", "Head",
+    "HeadScale", "HeightScale", "IdleAnimation", "JumpAnimation", "LeftArm",
+    "LeftLeg", "NeckAccessory", "Pants", "ProportionScale", "RightArm", "RightLeg",
+    "RunAnimation", "Shirt", "ShoulderAccessory", "SwimAnimation", "Torso",
+    "WaistAccessory", "WalkAnimation", "WidthScale", "HatAccessory", "BodyTypeScale"
+}
+
+local function color3ToArray(c)
+    if typeof(c) ~= "Color3" then return nil end
+    return {sanitizeNumber(c.R), sanitizeNumber(c.G), sanitizeNumber(c.B)}
+end
+
+local function arrayToColor3(v)
+    if type(v) ~= "table" then return Color3.new(1,1,1) end
+    return Color3.new(
+        math.clamp(tonumber(v[1]) or 1, 0, 1),
+        math.clamp(tonumber(v[2]) or 1, 0, 1),
+        math.clamp(tonumber(v[3]) or 1, 0, 1)
+    )
+end
+
+local function captureAvatarAppearance(char)
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+
+    local desc
+    local ok = pcall(function()
+        desc = hum:GetAppliedDescription()
+    end)
+    if not ok or not desc then return nil end
+
+    local out = {version = 1, props = {}, colors = {}}
+
+    for _, prop in ipairs(DESCRIPTION_PROPS) do
+        local okProp, value = pcall(function() return desc[prop] end)
+        if okProp and value ~= nil then
+            local typ = typeof(value)
+            if typ == "number" or typ == "string" or typ == "boolean" then
+                out.props[prop] = value
+            end
+        end
+    end
+
+    for _, prop in ipairs({"HeadColor", "LeftArmColor", "LeftLegColor", "RightArmColor", "RightLegColor", "TorsoColor"}) do
+        local okProp, value = pcall(function() return desc[prop] end)
+        if okProp and typeof(value) == "Color3" then
+            out.colors[prop] = color3ToArray(value)
+        end
+    end
+
+    return out
+end
+
+local function makeHumanoidDescription(snapshot)
+    if type(snapshot) ~= "table" then return nil end
+    local desc = Instance.new("HumanoidDescription")
+
+    for prop, value in pairs(snapshot.props or {}) do
+        pcall(function() desc[prop] = value end)
+    end
+    for prop, value in pairs(snapshot.colors or {}) do
+        pcall(function() desc[prop] = arrayToColor3(value) end)
+    end
+
+    return desc
+end
+
+-- ══════════════════════════════════════════════════════════
+-- COLORS
+-- ══════════════════════════════════════════════════════════
+local COL = {
+    bg     = Color3.fromRGB(14,14,20),
+    panel  = Color3.fromRGB(22,22,32),
+    panel2 = Color3.fromRGB(34,34,48),
+    panel3 = Color3.fromRGB(44,44,60),
+    accent = Color3.fromRGB(100,140,255),
+    text   = Color3.fromRGB(235,235,245),
+    sub    = Color3.fromRGB(140,140,165),
+    good   = Color3.fromRGB(80,210,130),
+    warn   = Color3.fromRGB(255,190,90),
+    bad    = Color3.fromRGB(240,90,90),
+}
+
+-- ══════════════════════════════════════════════════════════
+-- GUI
+-- ══════════════════════════════════════════════════════════
+local gui = new("ScreenGui", {
+    Name = "ReplayModUI", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = player:WaitForChild("PlayerGui")
+})
+
+local main = new("Frame", {
+    Name = "Main", Size = UDim2.new(0, 360, 0, 480),
+    Position = UDim2.new(1, -375, 0, 20),
+    BackgroundColor3 = COL.bg, BorderSizePixel = 0,
+    Active = true, Draggable = true, Parent = gui
+})
+corner(12, main); stroke(COL.panel3, 2, main)
+
+local header = new("Frame", {
+    Size = UDim2.new(1,0,0,38), BackgroundColor3 = COL.panel,
+    BorderSizePixel = 0, Parent = main
+})
+corner(12, header)
+new("Frame", {Size = UDim2.new(1,0,0,14), Position = UDim2.new(0,0,1,-14),
+    BackgroundColor3 = COL.panel, BorderSizePixel = 0, Parent = header})
+new("TextLabel", {
+    Size = UDim2.new(1,-80,1,0), Position = UDim2.new(0,12,0,0),
+    BackgroundTransparency = 1, Text = "◉  REPLAY MOD",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = header
+})
+local minBtn = new("TextButton", {
+    Size = UDim2.new(0,24,0,24), Position = UDim2.new(1,-58,0,7),
+    BackgroundColor3 = COL.panel3, Text = "−", TextColor3 = COL.text,
+    Font = Enum.Font.GothamBold, TextSize = 16, Parent = header
+})
+corner(6, minBtn)
+local closeBtn = new("TextButton", {
+    Size = UDim2.new(0,24,0,24), Position = UDim2.new(1,-30,0,7),
+    BackgroundColor3 = COL.panel3, Text = "×", TextColor3 = COL.text,
+    Font = Enum.Font.GothamBold, TextSize = 16, Parent = header
+})
+corner(6, closeBtn)
+
+local TAB_H = 32
+local tabRow = new("Frame", {
+    Size = UDim2.new(1,0,0,TAB_H), Position = UDim2.new(0,0,0,38),
+    BackgroundColor3 = COL.bg, BorderSizePixel = 0, Parent = main
+})
+pad(6, tabRow)
+new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0,4), SortOrder = Enum.SortOrder.LayoutOrder, Parent = tabRow })
+
+local tabs, tabContents, activeTab = {}, {}, nil
+local CONTENT_TOP = 38 + TAB_H
+
+local function buildTab(name, order, icon)
+    local btn = new("TextButton", {
+        Size = UDim2.new(0, 80, 1, 0), BackgroundColor3 = COL.panel,
+        Text = icon .. " " .. name, TextColor3 = COL.sub,
+        Font = Enum.Font.GothamBold, TextSize = 11,
+        LayoutOrder = order, AutoButtonColor = false, Parent = tabRow
+    })
+    corner(6, btn)
+    local content = new("Frame", {
+        Size = UDim2.new(1, 0, 1, -CONTENT_TOP - 30),
+        Position = UDim2.new(0, 0, 0, CONTENT_TOP),
+        BackgroundTransparency = 1, Visible = false, Parent = main
+    })
+    pad(10, content)
+    tabs[name] = btn
+    tabContents[name] = content
+    btn.MouseButton1Click:Connect(function()
+        for n, c in pairs(tabContents) do c.Visible = (n == name) end
+        for n, b in pairs(tabs) do
+            b.BackgroundColor3 = (n == name) and COL.accent or COL.panel
+            b.TextColor3 = (n == name) and Color3.new(1,1,1) or COL.sub
+        end
+        activeTab = name
+    end)
+    return content
+end
+
+local recordTab = buildTab("Record",   1, "⏺")
+local playTab   = buildTab("Studio", 2, "ST")
+local filesTab  = buildTab("Files",    3, "📁")
+local settingsTab = buildTab("Settings", 4, "⚙")
+
+local statusBar = new("Frame", {
+    Size = UDim2.new(1,0,0,28), Position = UDim2.new(0,0,1,-28),
+    BackgroundColor3 = COL.panel, BorderSizePixel = 0, Parent = main
+})
+corner(12, statusBar)
+new("Frame", {Size = UDim2.new(1,0,0,12), Position = UDim2.new(0,0,0,0),
+    BackgroundColor3 = COL.panel, BorderSizePixel = 0, Parent = statusBar})
+local statusDot = new("Frame", {
+    Size = UDim2.new(0,7,0,7), Position = UDim2.new(0,12,0.5,-3.5),
+    BackgroundColor3 = COL.good, Parent = statusBar
+})
+corner(4, statusDot)
+local statusLabel = new("TextLabel", {
+    Size = UDim2.new(1,-30,1,0), Position = UDim2.new(0,26,0,0),
+    BackgroundTransparency = 1, Text = "Ready",
+    TextColor3 = COL.sub, Font = Enum.Font.Gotham, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = statusBar
+})
+local function setStatus(t, c)
+    statusLabel.Text = t
+    statusDot.BackgroundColor3 = c or COL.good
+end
+
+local function button(text, pos, size, color, parent, small)
+    local b = new("TextButton", {
+        Size = size, Position = pos, BackgroundColor3 = color,
+        Text = text, TextColor3 = Color3.new(1,1,1),
+        Font = Enum.Font.GothamBold, TextSize = small and 11 or 12,
+        AutoButtonColor = true, Parent = parent
+    })
+    corner(6, b)
+    return b
+end
+
+-- ── Record tab ──
+local recBtn = button("⏺  Start Recording", UDim2.new(0,0,0,0),
+    UDim2.new(1,0,0,40), Color3.fromRGB(210,55,55), recordTab)
+local recStop = button("⏹  Stop", UDim2.new(0,0,0,46),
+    UDim2.new(1,0,0,28), COL.panel3, recordTab)
+
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,120), Position = UDim2.new(0,0,0,84),
+    BackgroundTransparency = 1,
+    Text = "Keys:\nR = record    P = play    Space = pause\nShift+P = freecam    F = spectate\nClick a player, then F to view them\nH = hide UI\n[ ] = speed    ← → = seek 5s",
+    TextColor3 = COL.sub, Font = Enum.Font.Gotham, TextSize = 11,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top, Parent = recordTab
+})
+
+-- ── Playback tab ──
+local studioModeLabel = new("TextLabel", {
+    Size = UDim2.new(1,0,0,18), Position = UDim2.new(0,0,0,-20),
+    BackgroundTransparency = 1, Text = "STUDIO MODE  •  replay editor",
+    TextColor3 = COL.accent, Font = Enum.Font.GothamBold, TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = playTab
+})
+local playBtn = button("▶  Play", UDim2.new(0,0,0,0),
+    UDim2.new(1,0,0,40), Color3.fromRGB(55,170,95), playTab)
+local timelineBG = new("Frame", {
+    Size = UDim2.new(1,0,0,10), Position = UDim2.new(0,0,0,52),
+    BackgroundColor3 = COL.panel3, Parent = playTab
+})
+corner(5, timelineBG)
+local timelineFill = new("Frame", {
+    Size = UDim2.new(0,0,1,0), BackgroundColor3 = COL.accent, Parent = timelineBG
+})
+corner(5, timelineFill)
+local timeLbl = new("TextLabel", {
+    Size = UDim2.new(1,0,0,18), Position = UDim2.new(0,0,0,66),
+    BackgroundTransparency = 1, Text = "0:00.0 / 0:00.0",
+    TextColor3 = COL.sub, Font = Enum.Font.Code, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = playTab
+})
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,18), Position = UDim2.new(0,0,0,90),
+    BackgroundTransparency = 1, Text = "Speed",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = playTab
+})
+local speedLbl = new("TextLabel", {
+    Size = UDim2.new(1,0,0,18), Position = UDim2.new(0,0,0,90),
+    BackgroundTransparency = 1, Text = "1.0x",
+    TextColor3 = COL.accent, Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Right, Parent = playTab
+})
+local speedSlider = new("Frame", {
+    Size = UDim2.new(1,0,0,12), Position = UDim2.new(0,0,0,112),
+    BackgroundColor3 = COL.panel3, Parent = playTab
+})
+corner(6, speedSlider)
+local speedFill = new("Frame", {
+    Size = UDim2.new(0.3,0,1,0), BackgroundColor3 = COL.accent, Parent = speedSlider
+})
+corner(6, speedFill)
+local jumpStartBtn = button("⏮", UDim2.new(0,0,0,140), UDim2.new(0.23,0,0,30), COL.panel3, playTab, true)
+local stepBackBtn = button("◀|", UDim2.new(0.25,0,0,140), UDim2.new(0.23,0,0,30), COL.panel3, playTab, true)
+local stepFwdBtn  = button("|▶", UDim2.new(0.5,0,0,140), UDim2.new(0.23,0,0,30), COL.panel3, playTab, true)
+local jumpEndBtn  = button("⏭", UDim2.new(0.75,0,0,140), UDim2.new(0.23,0,0,30), COL.panel3, playTab, true)
+
+-- ── Files tab ──
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,16), Position = UDim2.new(0,0,0,0),
+    BackgroundTransparency = 1, Text = "Replay Name",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = filesTab
+})
+local nameBox = new("TextBox", {
+    Size = UDim2.new(1,0,0,30), Position = UDim2.new(0,0,0,20),
+    BackgroundColor3 = COL.panel3, BorderSizePixel = 0,
+    Text = "", PlaceholderText = "my_replay",
+    TextColor3 = COL.text, PlaceholderColor3 = COL.sub,
+    Font = Enum.Font.Gotham, TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+    Parent = filesTab
+})
+corner(6, nameBox); pad(8, nameBox)
+local saveBtn    = button("💾  Save", UDim2.new(0,0,0,56),
+    UDim2.new(1,0,0,32), Color3.fromRGB(165,115,60), filesTab)
+local refreshBtn = button("🔄", UDim2.new(0,0,0,94),
+    UDim2.new(0.48,0,0,28), COL.panel3, filesTab, true)
+local deleteBtn  = button("🗑", UDim2.new(0.52,0,0,94),
+    UDim2.new(0.48,0,0,28), Color3.fromRGB(140,60,60), filesTab, true)
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,14), Position = UDim2.new(0,0,0,126),
+    BackgroundTransparency = 1, Text = "Click to select, right-click to load",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = filesTab
+})
+local fileScroll = new("ScrollingFrame", {
+    Size = UDim2.new(1,0,0,140), Position = UDim2.new(0,0,0,144),
+    BackgroundColor3 = COL.panel, BorderSizePixel = 0,
+    ScrollBarThickness = 4, CanvasSize = UDim2.new(0,0,0,0), Parent = filesTab
+})
+corner(8, fileScroll)
+new("UIListLayout", { Padding = UDim.new(0,3),
+    SortOrder = Enum.SortOrder.LayoutOrder, Parent = fileScroll})
+pad(6, fileScroll)
+local selectedFile = nil
+
+-- ── Settings tab ──
+local function addToggle(label, getter, setter, yPos)
+    local row = new("Frame", {
+        Size = UDim2.new(1,0,0,40), Position = UDim2.new(0,0,0,yPos),
+        BackgroundColor3 = COL.panel, BorderSizePixel = 0, Parent = settingsTab
+    })
+    corner(8, row)
+    new("TextLabel", {
+        Size = UDim2.new(1,-70,1,0), Position = UDim2.new(0,12,0,0),
+        BackgroundTransparency = 1, Text = label,
+        TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left, Parent = row
+    })
+    local enabled = getter()
+    local switch = new("Frame", {
+        Size = UDim2.new(0,40,0,20), Position = UDim2.new(1,-52,0.5,-10),
+        BackgroundColor3 = enabled and COL.good or COL.panel3, Parent = row
+    })
+    corner(10, switch)
+    local knob = new("Frame", {
+        Size = UDim2.new(0,14,0,14),
+        Position = enabled and UDim2.new(1,-18,0.5,-7) or UDim2.new(0,4,0.5,-7),
+        BackgroundColor3 = Color3.new(1,1,1), Parent = switch
+    })
+    corner(7, knob)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1,0,1,0), BackgroundTransparency = 1, Text = "", Parent = row
+    })
+    btn.MouseButton1Click:Connect(function()
+        local newVal = not getter()
+        setter(newVal)
+        TweenService:Create(switch, TweenInfo.new(0.15),
+            {BackgroundColor3 = newVal and COL.good or COL.panel3}):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15),
+            {Position = newVal and UDim2.new(1,-18,0.5,-7) or UDim2.new(0,4,0.5,-7)}):Play()
+    end)
+end
+
+addToggle("Hide My Character", function() return hideSelfEnabled end, function(v)
+    hideSelfEnabled = v
+
+    -- This setting is specifically for replay/freecam visibility.
+    -- Do not reference Freecam here: Freecam is declared later in the script.
+    if v then
+        if isPlaying then
+            hideSelfChar()
+        end
+    else
+        showSelfChar()
+    end
+end, 0)
+addToggle("Hide Other Players", function() return realHidden end, function(v)
+    realHidden = v
+    if v then hideAllReal() else if not isPlaying then showAllReal() end end
+end, 46)
+addToggle("Show Nametags", function() return _G.ReplayShowNametags ~= false end, function(v)
+    _G.ReplayShowNametags = v
+    for _, ghost in pairs(replayCharacters) do
+        local hum = ghost:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.NameDisplayDistance = v and 100 or 0
+            hum.HealthDisplayDistance = v and 100 or 0
+        end
+    end
+end, 92)
+addToggle("Hide Dead Bodies", function() return _G.ReplayHideDead == true end, function(v)
+    _G.ReplayHideDead = v
+end, 138)
+addToggle("Use Recorded Camera", function() return _G.ReplayUseRecordedCamera == true end, function(v)
+    _G.ReplayUseRecordedCamera = v
+end, 184)
+addToggle("Smooth Replay", function() return _G.ReplaySmooth == true end, function(v)
+    _G.ReplaySmooth = v
+end, 230)
+addToggle("Use Gameplay Footage", function() return useGameplayMap end, function(v)
+    useGameplayMap = v
+    if isPlaying then
+        setStatus("Map option changed • restart replay to apply", COL.warn)
+    end
+end, 276)
+
+-- ── Timeline bar ──
+local tbar = new("Frame", {
+    Size = UDim2.new(1, -40, 0, 46),
+    Position = UDim2.new(0, 20, 1, -64),
+    BackgroundColor3 = COL.bg, BackgroundTransparency = 0.06,
+    BorderSizePixel = 0, Visible = false, ZIndex = 30, Parent = gui
+})
+corner(10, tbar); stroke(COL.accent, 1, tbar)
+local tbarPlay = new("TextButton", {
+    Size = UDim2.new(0, 32, 0, 32), Position = UDim2.new(0, 7, 0, 7),
+    BackgroundColor3 = COL.panel, Text = "⏸",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 16, ZIndex = 31, Parent = tbar
+})
+corner(6, tbarPlay)
+local tbarRew = new("TextButton", {
+    Size = UDim2.new(0, 28, 0, 32), Position = UDim2.new(0, 43, 0, 7),
+    BackgroundColor3 = COL.panel, Text = "⏪",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 12, ZIndex = 31, Parent = tbar
+})
+corner(6, tbarRew)
+local tbarFwd = new("TextButton", {
+    Size = UDim2.new(0, 28, 0, 32), Position = UDim2.new(0, 75, 0, 7),
+    BackgroundColor3 = COL.panel, Text = "⏩",
+    TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 12, ZIndex = 31, Parent = tbar
+})
+corner(6, tbarFwd)
+local tbarCur = new("TextLabel", {
+    Size = UDim2.new(0, 60, 1, 0), Position = UDim2.new(0, 108, 0, 0),
+    BackgroundTransparency = 1, Text = "0:00.0",
+    TextColor3 = COL.text, Font = Enum.Font.Code, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 31, Parent = tbar
+})
+local tbarSlider = new("Frame", {
+    Size = UDim2.new(1, -228, 0, 16), Position = UDim2.new(0, 172, 0.5, -8),
+    BackgroundColor3 = COL.panel3, ZIndex = 31, Parent = tbar
+})
+corner(8, tbarSlider)
+local tbarFill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = COL.accent, ZIndex = 32, Parent = tbarSlider
+})
+corner(8, tbarFill)
+local tbarPlayhead = new("Frame", {
+    Size = UDim2.new(0, 4, 1, 6), Position = UDim2.new(0, -2, 0, -3),
+    BackgroundColor3 = Color3.new(1,1,1), BorderSizePixel = 0, ZIndex = 33, Parent = tbarSlider
+})
+corner(2, tbarPlayhead)
+local tbarTot = new("TextLabel", {
+    Size = UDim2.new(0, 60, 1, 0), Position = UDim2.new(1, -65, 0, 0),
+    BackgroundTransparency = 1, Text = "0:00.0",
+    TextColor3 = COL.text, Font = Enum.Font.Code, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Right, ZIndex = 31, Parent = tbar
+})
+
+local pauseOverlay = new("Frame", {
+    Size = UDim2.new(0, 300, 0, 60), Position = UDim2.new(0.5, -150, 0, 60),
+    BackgroundColor3 = COL.bg, BackgroundTransparency = 0.08,
+    BorderSizePixel = 0, Visible = false, ZIndex = 40, Parent = gui
+})
+corner(12, pauseOverlay); stroke(COL.accent, 2, pauseOverlay)
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,30), Position = UDim2.new(0,0,0,4),
+    BackgroundTransparency = 1, Text = "⏸  PAUSED",
+    TextColor3 = COL.accent, Font = Enum.Font.GothamBold, TextSize = 20,
+    ZIndex = 41, Parent = pauseOverlay
+})
+new("TextLabel", {
+    Size = UDim2.new(1,0,0,18), Position = UDim2.new(0,0,0,36),
+    BackgroundTransparency = 1, Text = "SPACE resume   |   ← → seek",
+    TextColor3 = COL.sub, Font = Enum.Font.Gotham, TextSize = 11,
+    ZIndex = 41, Parent = pauseOverlay
+})
+
+local loadIndicator = new("Frame", {
+    Size = UDim2.new(0, 240, 0, 34), Position = UDim2.new(0.5, -120, 0, 20),
+    BackgroundColor3 = COL.bg, BackgroundTransparency = 0.05,
+    BorderSizePixel = 0, Visible = false, ZIndex = 50, Parent = gui
+})
+corner(10, loadIndicator); stroke(COL.accent, 1, loadIndicator)
+local loadLabel = new("TextLabel", {
+    Size = UDim2.new(1,-16,1,0), Position = UDim2.new(0,8,0,0),
+    BackgroundTransparency = 1, Text = "Loading…",
+    TextColor3 = COL.text, Font = Enum.Font.Gotham, TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 51, Parent = loadIndicator
+})
+
+-- ══════════════════════════════════════════════════════════
+-- FREECAM (exact copy from provided script)
+-- ══════════════════════════════════════════════════════════
+local pi    = math.pi
+local abs   = math.abs
+local clamp = math.clamp
+local exp   = math.exp
+local rad   = math.rad
+local sign  = math.sign
+local sqrt  = math.sqrt
+local tan   = math.tan
+
+local FREECAM_ENABLED_ATTRIBUTE_NAME = "FreecamEnabled"
+local TOGGLE_INPUT_PRIORITY = Enum.ContextActionPriority.Low.Value
+local INPUT_PRIORITY = Enum.ContextActionPriority.High.Value
+local FREECAM_MACRO_KB = {Enum.KeyCode.LeftShift, Enum.KeyCode.P}
+
+local NAV_GAIN = Vector3.new(1, 1, 1)*64
+local PAN_GAIN = Vector2.new(0.75, 1)*8
+local FOV_GAIN = 300
+local PITCH_LIMIT = rad(90)
+local VEL_STIFFNESS = 1.5
+local PAN_STIFFNESS = 1.0
+local FOV_STIFFNESS = 4.0
+
+local Spring = {} do
+    Spring.__index = Spring
+    function Spring.new(freq, pos)
+        local self = setmetatable({}, Spring)
+        self.f = freq; self.p = pos; self.v = pos*0
+        return self
+    end
+    function Spring:Update(dt, goal)
+        local f = self.f*2*pi
+        local p0 = self.p
+        local v0 = self.v
+        local offset = goal - p0
+        local decay = exp(-f*dt)
+        local p1 = goal + (v0*dt - offset*(f*dt + 1))*decay
+        local v1 = (f*dt*(offset*f - v0) + v0)*decay
+        self.p = p1; self.v = v1
+        return p1
+    end
+    function Spring:Reset(pos)
+        self.p = pos; self.v = pos*0
+    end
+end
+
+local cameraPos = Vector3.new()
+local cameraRot = Vector2.new()
+local cameraFov = 0
+local velSpring = Spring.new(VEL_STIFFNESS, Vector3.new())
+local panSpring = Spring.new(PAN_STIFFNESS, Vector2.new())
+local fovSpring = Spring.new(FOV_STIFFNESS, 0)
+
+local Input = {} do
+    local thumbstickCurve do
+        local K_CURVATURE = 2.0
+        local K_DEADZONE = 0.15
+        local function fCurve(x) return (exp(K_CURVATURE*x) - 1)/(exp(K_CURVATURE) - 1) end
+        local function fDeadzone(x) return fCurve((x - K_DEADZONE)/(1 - K_DEADZONE)) end
+        function thumbstickCurve(x) return sign(x)*clamp(fDeadzone(abs(x)), 0, 1) end
+    end
+    local gamepad = {ButtonX=0,ButtonY=0,DPadDown=0,DPadUp=0,ButtonL2=0,ButtonR2=0,
+        Thumbstick1=Vector2.new(),Thumbstick2=Vector2.new()}
+    local keyboard = {W=0,A=0,S=0,D=0,E=0,Q=0,U=0,H=0,J=0,K=0,I=0,Y=0,Up=0,Down=0,LeftShift=0,RightShift=0}
+    local mouse = {Delta=Vector2.new(),MouseWheel=0}
+    local NAV_GAMEPAD_SPEED = Vector3.new(1,1,1)
+    local NAV_KEYBOARD_SPEED = Vector3.new(1,1,1)
+    local PAN_MOUSE_SPEED = Vector2.new(1,1)*(pi/64)
+    local PAN_GAMEPAD_SPEED = Vector2.new(1,1)*(pi/8)
+    local FOV_WHEEL_SPEED = 1.0
+    local FOV_GAMEPAD_SPEED = 0.25
+    local NAV_ADJ_SPEED = 0.75
+    local NAV_SHIFT_MUL = 0.25
+    local navSpeed = 1
+
+    function Input.Vel(dt)
+        navSpeed = clamp(navSpeed + dt*(keyboard.Up - keyboard.Down)*NAV_ADJ_SPEED, 0.01, 4)
+        local kGamepad = Vector3.new(
+            thumbstickCurve(gamepad.Thumbstick1.X),
+            thumbstickCurve(gamepad.ButtonR2) - thumbstickCurve(gamepad.ButtonL2),
+            thumbstickCurve(-gamepad.Thumbstick1.Y))*NAV_GAMEPAD_SPEED
+        local kKeyboard = Vector3.new(
+            keyboard.D - keyboard.A + keyboard.K - keyboard.H,
+            keyboard.E - keyboard.Q + keyboard.I - keyboard.Y,
+            keyboard.S - keyboard.W + keyboard.J - keyboard.U)*NAV_KEYBOARD_SPEED
+        local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+            or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+        return (kGamepad + kKeyboard)*(navSpeed*(shift and NAV_SHIFT_MUL or 1))
+    end
+    function Input.Pan()
+        local kGamepad = Vector2.new(
+            thumbstickCurve(gamepad.Thumbstick2.Y),
+            thumbstickCurve(-gamepad.Thumbstick2.X))*PAN_GAMEPAD_SPEED
+        local kMouse = mouse.Delta*PAN_MOUSE_SPEED
+        mouse.Delta = Vector2.new()
+        return kGamepad + kMouse
+    end
+    function Input.Fov()
+        local kGamepad = (gamepad.ButtonX - gamepad.ButtonY)*FOV_GAMEPAD_SPEED
+        local kMouse = mouse.MouseWheel*FOV_WHEEL_SPEED
+        mouse.MouseWheel = 0
+        return kGamepad + kMouse
+    end
+
+    local function Keypress(_, state, input)
+        keyboard[input.KeyCode.Name] = state == Enum.UserInputState.Begin and 1 or 0
+        return Enum.ContextActionResult.Sink
+    end
+    local function GpButton(_, state, input)
+        gamepad[input.KeyCode.Name] = state == Enum.UserInputState.Begin and 1 or 0
+        return Enum.ContextActionResult.Sink
+    end
+    local function MousePan(_, _, input)
+        local delta = input.Delta
+        mouse.Delta = Vector2.new(-delta.y, -delta.x)
+        return Enum.ContextActionResult.Sink
+    end
+    local function Thumb(_, _, input)
+        gamepad[input.KeyCode.Name] = input.Position
+        return Enum.ContextActionResult.Sink
+    end
+    local function Trigger(_, _, input)
+        gamepad[input.KeyCode.Name] = input.Position.z
+        return Enum.ContextActionResult.Sink
+    end
+    local function MouseWheel(_, _, input)
+        mouse[input.UserInputType.Name] = -input.Position.z
+        return Enum.ContextActionResult.Sink
+    end
+    local function Zero(t)
+        for k, v in pairs(t) do t[k] = v*0 end
+    end
+
+    local inputConnections = {}
+    local function disconnectAll()
+        for _, c in ipairs(inputConnections) do pcall(function() c:Disconnect() end) end
+        table.clear(inputConnections)
+    end
+    local keyNames = {W=true,U=true,A=true,H=true,S=true,J=true,D=true,K=true,E=true,I=true,Q=true,Y=true,Up=true,Down=true}
+    local gpButtonNames = {ButtonX=true,ButtonY=true}
+
+    function Input.StartCapture()
+        disconnectAll()
+        table.insert(inputConnections, UserInputService.InputBegan:Connect(function(input)
+            if keyNames[input.KeyCode.Name] then
+                keyboard[input.KeyCode.Name] = 1
+            elseif gpButtonNames[input.KeyCode.Name] then
+                gamepad[input.KeyCode.Name] = 1
+            end
+        end))
+        table.insert(inputConnections, UserInputService.InputEnded:Connect(function(input)
+            if keyNames[input.KeyCode.Name] then
+                keyboard[input.KeyCode.Name] = 0
+            elseif gpButtonNames[input.KeyCode.Name] then
+                gamepad[input.KeyCode.Name] = 0
+            end
+        end))
+        table.insert(inputConnections, UserInputService.InputChanged:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseMovement then
+                local d = input.Delta
+                mouse.Delta = Vector2.new(-d.Y, -d.X)
+            elseif input.UserInputType == Enum.UserInputType.MouseWheel then
+                mouse.MouseWheel = -input.Position.Z
+            elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
+                if input.KeyCode == Enum.KeyCode.Thumbstick1 or input.KeyCode == Enum.KeyCode.Thumbstick2 then
+                    gamepad[input.KeyCode.Name] = input.Position
+                elseif input.KeyCode == Enum.KeyCode.ButtonR2 or input.KeyCode == Enum.KeyCode.ButtonL2 then
+                    gamepad[input.KeyCode.Name] = input.Position.Z
+                end
+            end
+        end))
+    end
+    function Input.StopCapture()
+        navSpeed = 1
+        Zero(gamepad); Zero(keyboard); Zero(mouse)
+        disconnectAll()
+    end
+end
+
+local function StepFreecam(dt)
+    local vel = velSpring:Update(dt, Input.Vel(dt))
+    local pan = panSpring:Update(dt, Input.Pan())
+    local fov = fovSpring:Update(dt, Input.Fov())
+    local zoomFactor = sqrt(tan(rad(70/2))/tan(rad(cameraFov/2)))
+    cameraFov = clamp(cameraFov + fov*FOV_GAIN*(dt/zoomFactor), 1, 120)
+    cameraRot = cameraRot + pan*PAN_GAIN*(dt/zoomFactor)
+    cameraRot = Vector2.new(clamp(cameraRot.x, -PITCH_LIMIT, PITCH_LIMIT), cameraRot.y%(2*pi))
+    local cf = CFrame.new(cameraPos)*CFrame.fromOrientation(cameraRot.x, cameraRot.y, 0)*CFrame.new(vel*NAV_GAIN*dt)
+    cameraPos = cf.p
+    Camera.CFrame = cf
+    Camera.Focus = cf
+    Camera.FieldOfView = cameraFov
+end
+
+local PlayerState = {} do
+    local mouseBehavior, mouseIconEnabled, cameraType, cameraFocus, cameraCFrame, cameraFieldOfView
+    local screenGuis = {}
+
+    function PlayerState.Push()
+        -- Never touch Roblox CoreGui/StarterGui. Keeping the normal Roblox HUD
+        -- visible is important for first-person and shift-lock recordings, and
+        -- some executor clients throw inside the CoreGui locale module when
+        -- GetCore/SetCore APIs are used.
+        local pg = player:FindFirstChildOfClass("PlayerGui")
+        if pg then
+            for _, g in ipairs(pg:GetChildren()) do
+                if g:IsA("ScreenGui") and g.Enabled and g.Name ~= "ReplayModUI" then
+                    -- Only hide ordinary game ScreenGuis while freecam is active.
+                    -- CoreGui (shift-lock indicator, Roblox HUD, etc.) is untouched.
+                    screenGuis[#screenGuis + 1] = g
+                    g.Enabled = false
+                end
+            end
+        end
+        cameraFieldOfView = Camera.FieldOfView
+        cameraType = Camera.CameraType
+        cameraCFrame = Camera.CFrame
+        cameraFocus = Camera.Focus
+        mouseIconEnabled = UserInputService.MouseIconEnabled
+        mouseBehavior = UserInputService.MouseBehavior
+    end
+    function PlayerState.Pop()
+        for _, g in ipairs(screenGuis) do
+            if g and g.Parent then pcall(function() g.Enabled = true end) end
+        end
+        table.clear(screenGuis)
+        pcall(function() Camera.FieldOfView = cameraFieldOfView or Camera.FieldOfView end)
+        pcall(function() Camera.CameraType = cameraType or Enum.CameraType.Custom end)
+        pcall(function() Camera.CFrame = cameraCFrame or Camera.CFrame end)
+        pcall(function() Camera.Focus = cameraFocus or Camera.Focus end)
+        pcall(function() UserInputService.MouseIconEnabled = mouseIconEnabled ~= false end)
+        pcall(function() UserInputService.MouseBehavior = mouseBehavior or Enum.MouseBehavior.Default end)
+    end
+end
+
+local Freecam = {enabled = false}
+function Freecam.Start()
+    if Freecam.enabled then return end
+    Freecam.enabled = true
+    local cf = Camera.CFrame
+    local rx, ry = cf:ToOrientation(); cameraRot = Vector2.new(rx, ry)
+    cameraPos = cf.p
+    cameraFov = Camera.FieldOfView
+    velSpring:Reset(Vector3.new())
+    panSpring:Reset(Vector2.new())
+    fovSpring:Reset(0)
+    PlayerState.Push()
+    RunService:BindToRenderStep("Freecam", Enum.RenderPriority.Camera.Value, StepFreecam)
+    Input.StartCapture()
+    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+    UserInputService.MouseIconEnabled = false
+    if hideSelfEnabled then hideSelfChar() end
+    setStatus("Freecam ON — WASD move, mouse look, scroll zoom", COL.accent)
+end
+function Freecam.Stop()
+    if not Freecam.enabled then return end
+    Freecam.enabled = false
+    Input.StopCapture()
+    RunService:UnbindFromRenderStep("Freecam")
+    PlayerState.Pop()
+
+    -- Hide My Character is only meant to hide the real character while
+    -- freecam/replay is active. If the user has it enabled, restore the
+    -- hidden state immediately when freecam stops only if a replay is not
+    -- running; otherwise leave it hidden for the replay.
+    if not isPlaying or not hideSelfEnabled then
+        showSelfChar()
+    end
+    if not isPlaying then
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+    elseif not replayCursorUnlocked then
+        UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+        UserInputService.MouseIconEnabled = false
+    end
+
+    setStatus("Freecam off", COL.good)
+end
+function Freecam.Toggle()
+    if Freecam.enabled then Freecam.Stop() else Freecam.Start() end
+end
+
+-- Shift+P is handled by the main InputBegan listener below.
+-- This avoids executor differences in ContextAction chord handling.
+
+
+-- ══════════════════════════════════════════════════════════
+-- CAPTURE
+-- ══════════════════════════════════════════════════════════
+local function captureAccessoryPoses(char)
+    local poses = {}
+    if not char then return poses end
+    for _, accessory in ipairs(char:GetChildren()) do
+        if accessory:IsA("Accessory") then
+            local handle = accessory:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then
+                local key = accessory.Name .. "::" .. handle.Name
+                local ok, cf = pcall(function() return handle.CFrame end)
+                if ok and cf then
+                    poses[key] = {
+                        name = accessory.Name,
+                        handle = handle.Name,
+                        cframe = safeCFrameComponents(cf),
+                    }
+                end
+            end
+        end
+    end
+    return poses
+end
+
+local function applyAccessoryPoses(ghost, poses)
+    if not ghost or type(poses) ~= "table" then return end
+    for _, pose in pairs(poses) do
+        if type(pose) == "table" and pose.cframe then
+            local accessory = ghost:FindFirstChild(tostring(pose.name or ""))
+            local handle = accessory and accessory:FindFirstChild(tostring(pose.handle or "Handle"))
+            if handle and handle:IsA("BasePart") then
+                pcall(function()
+                    handle.Anchored = false
+                    handle.CanCollide = false
+                    handle.CanTouch = false
+                    handle.CanQuery = false
+                    handle.CFrame = cframeFromSerialized(pose.cframe)
+                    handle.AssemblyLinearVelocity = Vector3.zero
+                    handle.AssemblyAngularVelocity = Vector3.zero
+                end)
+            end
+        end
+    end
+end
+
+local function captureFrame(char)
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return nil end
+
+    local hrpCF
+    local ok = pcall(function() hrpCF = hrp.CFrame end)
+    if not ok or not hrpCF then return nil end
+
+    if hum.Health <= 0 then
+        return {
+            position = hrpCF.Position,
+            rotation = hrpCF - hrpCF.Position,
+            velocity = hrp.Velocity,
+            health = 0, maxHealth = hum.MaxHealth,
+            hipHeight = hum.HipHeight,
+            dead = true, animations = {}, accessories = captureAccessoryPoses(char),
+        }
+    end
+
+    local anims = {}
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if animator then
+        for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+            table.insert(anims, {
+                id = t.Animation.AnimationId, time = t.TimePosition,
+                speed = t.Speed, weight = t.WeightCurrent, priority = t.Priority.Name,
+            })
+        end
+    end
+    return {
+        position = hrpCF.Position,
+        rotation = hrpCF - hrpCF.Position,
+        velocity = hrp.Velocity,
+        health = hum.Health, maxHealth = hum.MaxHealth,
+        hipHeight = hum.HipHeight,
+        dead = false,
+        animations = anims,
+        accessories = captureAccessoryPoses(char),
+    }
+end
+
+-- ══════════════════════════════════════════════════════════
+-- HIDE / SHOW
+-- ══════════════════════════════════════════════════════════
+local hiddenSelfSaved = nil
+
+local function hideChar(char)
+    if not char then return nil end
+    local saved = {}
+    for _, o in ipairs(char:GetDescendants()) do
+        if o:IsA("BasePart") or o:IsA("Decal") or o:IsA("Texture") then
+            saved[o] = o.Transparency
+            o.Transparency = 1
+        end
+    end
+    return saved
+end
+
+local function restoreChar(saved)
+    if not saved then return end
+    for o, t in pairs(saved) do
+        if o and o.Parent then pcall(function() o.Transparency = t end) end
+    end
+end
+
+local function hideAllReal()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and not hiddenPlayers[p.UserId] then
+            hiddenPlayers[p.UserId] = hideChar(p.Character)
+        end
+    end
+end
+
+local function showAllReal()
+    for _, s in pairs(hiddenPlayers) do restoreChar(s) end
+    hiddenPlayers = {}
+end
+
+local function hideSelfChar()
+    if hiddenSelfSaved or not player.Character then return end
+    hiddenSelfSaved = hideChar(player.Character)
+end
+
+local function showSelfChar()
+    if hiddenSelfSaved then
+        restoreChar(hiddenSelfSaved)
+        hiddenSelfSaved = nil
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if not (isPlaying or realHidden) then return end
+    for _, p in ipairs(Players:GetPlayers()) do
+        -- During playback, NEVER allow a live player who is not represented by
+        -- the recording to leak into the replay. Recorded players are hidden too
+        -- because their replay ghosts are the ones being displayed.
+        if p ~= player and p.Character and not hiddenPlayers[p.UserId] then
+            hiddenPlayers[p.UserId] = hideChar(p.Character)
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- GHOST CREATION
+-- ══════════════════════════════════════════════════════════
+local function createPlaceholder(name, rigType)
+    local model = Instance.new("Model")
+    model.Name = name
+
+    local hrp = Instance.new("Part")
+    hrp.Name = "HumanoidRootPart"
+    hrp.Size = Vector3.new(2, 2, 1)
+    hrp.Transparency = 1
+    hrp.CanCollide = false
+    hrp.Anchored = true
+    hrp.Parent = model
+
+    local hum = Instance.new("Humanoid")
+    hum.DisplayName = name
+    hum.NameDisplayDistance = (_G.ReplayShowNametags ~= false) and 100 or 0
+    hum.HealthDisplayDistance = (_G.ReplayShowNametags ~= false) and 100 or 0
+    hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Viewer
+    hum.MaxHealth = 100
+    hum.Health = 100
+    hum.Parent = model
+
+    model.PrimaryPart = hrp
+    model.Parent = workspace
+    return model
+end
+
+local function setupGhost(model, uid, rigType, firstFrame)
+    -- IMPORTANT:
+    -- Do NOT anchor every limb. Doing that prevents Motor6D animation from
+    -- moving arms, legs, head, hats and other attached accessories correctly.
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") then
+            d.CanCollide = false
+            d.CanQuery = false
+            d.CanTouch = false
+            d.Massless = true
+
+            -- The root is our replay "handle". The rest of the rig must remain
+            -- unanchored so Animator/Motor6D tracks can move it.
+            d.Anchored = (d.Name == "HumanoidRootPart")
+        elseif d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
+            d:Destroy()
+        elseif d:IsA("Highlight") then
+            d:Destroy()
+        end
+    end
+
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        model.PrimaryPart = hrp
+        hrp.Anchored = true
+        hrp.CanCollide = false
+        hrp.Transparency = 1
+    end
+
+    -- Make accessories follow the rig. Accessory handles normally use welds/
+    -- attachments; keep them visible and non-collidable.
+    for _, accessory in ipairs(model:GetChildren()) do
+        if accessory:IsA("Accessory") then
+            local handle = accessory:FindFirstChild("Handle")
+            if handle and handle:IsA("BasePart") then
+                handle.Anchored = false
+                handle.CanCollide = false
+                handle.CanQuery = false
+                handle.CanTouch = false
+                handle.Massless = true
+            end
+        end
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then
+        hum.DisplayName = model.Name
+        hum.NameDisplayDistance = (_G.ReplayShowNametags ~= false) and 100 or 0
+        hum.HealthDisplayDistance = (_G.ReplayShowNametags ~= false) and 100 or 0
+        hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.Viewer
+
+        hum.WalkSpeed = 0
+        hum.JumpPower = 0
+        hum.JumpHeight = 0
+        hum.PlatformStand = true
+        hum.AutoRotate = false
+        -- Never let the replay Humanoid destroy its joints when we set
+        -- Health to 0 for a recorded death. Otherwise the body/hats can
+        -- disappear or fall apart exactly when the dead frame is applied.
+        pcall(function() hum.BreakJointsOnDeath = false end)
+        pcall(function() hum.RequiresNeck = false end)
+
+        pcall(function() hum.EvaluateStateMachine = false end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+
+        -- Do not disable every Humanoid state here. That can interfere with
+        -- animation playback on some avatar rigs.
+        if not hum:FindFirstChildOfClass("Animator") then
+            Instance.new("Animator", hum)
+        end
+
+        local animScript = hum:FindFirstChild("Animate")
+        if animScript then
+            animScript:Destroy()
+        end
+
+        if firstFrame and firstFrame.hipHeight then
+            hum.HipHeight = firstFrame.hipHeight
+        end
+    end
+
+    if firstFrame and hrp then
+        hrp.CFrame = CFrame.new(firstFrame.position) * firstFrame.rotation
+    end
+end
+
+local function loadGhostWithTimeout(uid, rigType, timeout, appearance)
+    local result = nil
+    local done = false
+
+    task.spawn(function()
+        -- First try the saved appearance. This is what fixes dead/left players:
+        -- their replay avatar no longer depends on their current Character.
+        if appearance then
+            local desc = makeHumanoidDescription(appearance)
+            if desc then
+                local ok, model = pcall(function()
+                    if Players.CreateHumanoidModelFromDescriptionAsync then
+                        return Players:CreateHumanoidModelFromDescriptionAsync(desc, rigType)
+                    elseif Players.CreateHumanoidModelFromDescription then
+                        return Players:CreateHumanoidModelFromDescription(desc, rigType)
+                    end
+                end)
+                if ok and model then result = model end
+            end
+        end
+
+        -- Fallback for older environments.
+        if not result then
+            local ok, model = pcall(function()
+                return Players:CreateHumanoidModelFromUserId(uid)
+            end)
+            if ok and model then
+                result = model
+            else
+                local ok2, model2 = pcall(function()
+                    if Players.CreateHumanoidModelFromUserIdAsync then
+                        return Players:CreateHumanoidModelFromUserIdAsync(uid)
+                    end
+                end)
+                if ok2 and model2 then result = model2 end
+            end
+        end
+
+        done = true
+    end)
+
+    local startT = tick()
+    while not done and (tick() - startT) < (timeout or LOAD_TIMEOUT) do
+        RunService.Heartbeat:Wait()
+    end
+    return result
+end
+
+local function clearGhosts()
+    for _, m in pairs(replayCharacters) do
+        if m and m.Parent then m:Destroy() end
+    end
+    replayCharacters = {}
+    replayAnimTracks = {}
+end
+
+-- ══════════════════════════════════════════════════════════
+-- ANIMATIONS
+-- ══════════════════════════════════════════════════════════
+local function updateAnims(uid, hum, anims, speedMul)
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then return end
+    local tracks = replayAnimTracks[uid]
+    if not tracks then tracks = {}; replayAnimTracks[uid] = tracks end
+
+    local wanted = {}
+    for _, a in ipairs(anims) do
+        wanted[a.id] = a
+        local track = tracks[a.id]
+        if not track then
+            local animation = Instance.new("Animation")
+            animation.AnimationId = a.id
+            local ok, t = pcall(function() return animator:LoadAnimation(animation) end)
+            if (not ok or not t) and hum.LoadAnimation then
+                ok, t = pcall(function() return hum:LoadAnimation(animation) end)
+            end
+            if ok and t then
+                local prio = Enum.AnimationPriority[a.priority]
+                if prio then t.Priority = prio end
+                t.Looped = true
+                pcall(function() t:Play(0) end)
+                tracks[a.id] = t
+                track = t
+            end
+        end
+        if track then
+            pcall(function()
+                track.TimePosition = a.time
+                track:AdjustSpeed((a.speed or 1) * speedMul)
+                if a.weight and a.weight > 0 then
+                    track:AdjustWeight(a.weight, 0)
+                end
+            end)
+        end
+    end
+    for id, t in pairs(tracks) do
+        if not wanted[id] then
+            pcall(function() t:Stop(0) end)
+            tracks[id] = nil
+        end
+    end
+end
+
+local function stopAllAnims()
+    for _, tracks in pairs(replayAnimTracks) do
+        for _, t in pairs(tracks) do pcall(function() t:Stop(0) end) end
+    end
+    replayAnimTracks = {}
+end
+
+-- ══════════════════════════════════════════════════════════
+-- FRAME LOOKUP + APPLY
+-- ══════════════════════════════════════════════════════════
+local function frameAt(frames, t)
+    if #frames == 0 then return nil end
+    local lo, hi = 1, #frames
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if frames[mid].time < t then lo = mid + 1 else hi = mid end
+    end
+    local a = frames[math.max(lo - 1, 1)]
+    local b = frames[lo]
+    if math.abs(a.time - t) <= math.abs(b.time - t) then return a else return b end
+end
+
+local function frameInterpolated(frames, t)
+    if not _G.ReplaySmooth or #frames < 2 then
+        return frameAt(frames, t)
+    end
+    local lo, hi = 1, #frames
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if frames[mid].time < t then lo = mid + 1 else hi = mid end
+    end
+    local b = frames[lo]
+    local a = frames[math.max(1, lo - 1)]
+    if not a or not b or a == b or b.time <= a.time then return b or a end
+    local alpha = math.clamp((t - a.time) / (b.time - a.time), 0, 1)
+    local cfA = CFrame.new(a.position) * a.rotation
+    local cfB = CFrame.new(b.position) * b.rotation
+    local ok, cf = pcall(function() return cfA:Lerp(cfB, alpha) end)
+    if ok and cf then
+        return {
+            time = t,
+            position = cf.Position,
+            rotation = cf - cf.Position,
+            health = (a.health or 100) + ((b.health or 100) - (a.health or 100))*alpha,
+            maxHealth = b.maxHealth or a.maxHealth or 100,
+            hipHeight = b.hipHeight or a.hipHeight or 0,
+            dead = b.dead,
+            animations = b.animations or {},
+            accessories = b.accessories or a.accessories or {},
+        }
+    end
+    return b
+end
+
+local function cameraFrameAt(frames, t)
+    if not frames or #frames == 0 then return nil end
+    local lo, hi = 1, #frames
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if frames[mid].time < t then lo = mid + 1 else hi = mid end
+    end
+    local b = frames[lo]
+    local a = frames[math.max(1, lo - 1)]
+    if not _G.ReplaySmooth or a == b or not a or b.time <= a.time then return b and b.cframe end
+    local alpha = math.clamp((t-a.time)/(b.time-a.time),0,1)
+    local ok, cf = pcall(function() return a.cframe:Lerp(b.cframe, alpha) end)
+    return ok and cf or b.cframe
+end
+
+local function applyFrame(ghost, f, animSpeed, uid)
+    local hrp = ghost.PrimaryPart or ghost:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local hum = ghost:FindFirstChildOfClass("Humanoid")
+
+    if f.dead then
+        -- A dead player remains as a replay body at the recorded death position
+        -- unless the user explicitly enabled Hide Dead Bodies.
+        if hum then
+            pcall(function() hum:SetAttribute("ReplayDead", false) end)
+            pcall(function()
+                hum.MaxHealth = math.max(1, f.maxHealth or 100)
+                hum.Health = math.max(1, math.min(hum.MaxHealth, 1))
+                hum:SetAttribute("ReplayDead", true)
+                hum.PlatformStand = true
+                hum.AutoRotate = false
+                hum:ChangeState(Enum.HumanoidStateType.Physics)
+            end)
+        end
+        local tracks = replayAnimTracks[uid]
+        if tracks then
+            for id, track in pairs(tracks) do
+                pcall(function() track:Stop(0) end)
+                tracks[id] = nil
+            end
+        end
+
+        if _G.ReplayHideDead then
+            for _, d in ipairs(ghost:GetDescendants()) do
+                if d:IsA("BasePart") then d.LocalTransparencyModifier = 1 end
+                if d:IsA("Decal") or d:IsA("Texture") then d.LocalTransparencyModifier = 1 end
+            end
+        else
+            for _, d in ipairs(ghost:GetDescendants()) do
+                if d:IsA("BasePart") then d.LocalTransparencyModifier = 0 end
+                if d:IsA("Decal") or d:IsA("Texture") then d.LocalTransparencyModifier = 0 end
+            end
+            hrp.CFrame = CFrame.new(f.position) * f.rotation
+            applyAccessoryPoses(ghost, f.accessories)
+        end
+    else
+        for _, d in ipairs(ghost:GetDescendants()) do
+            if d:IsA("BasePart") then d.LocalTransparencyModifier = 0 end
+            if d:IsA("Decal") or d:IsA("Texture") then d.LocalTransparencyModifier = 0 end
+        end
+        hrp.CFrame = CFrame.new(f.position) * f.rotation
+        applyAccessoryPoses(ghost, f.accessories)
+        if hum then
+            pcall(function() hum:SetAttribute("ReplayDead", false) end)
+            pcall(function()
+                hum.MaxHealth = math.max(1, f.maxHealth or 100)
+                hum.Health = math.clamp(f.health or hum.MaxHealth, 0, hum.MaxHealth)
+            end)
+        end
+        if hum and f.animations then
+            if #f.animations > 0 then
+                updateAnims(uid, hum, f.animations, animSpeed)
+            else
+                local tracks = replayAnimTracks[uid]
+                if tracks then
+                    for id, t in pairs(tracks) do
+                        pcall(function() t:Stop(0) end)
+                        tracks[id] = nil
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════
+-- SELECTION + SPECTATE
+-- ══════════════════════════════════════════════════════════
+local function setSelection(hum)
+    if selectionHighlight then
+        selectionHighlight:Destroy()
+        selectionHighlight = nil
+    end
+    selectedHumanoid = hum
+    if hum and hum.Parent then
+        selectionHighlight = Instance.new("Highlight")
+        selectionHighlight.Name = "ReplaySelect"
+        selectionHighlight.FillColor = Color3.fromRGB(100,180,255)
+        selectionHighlight.FillTransparency = 0.75
+        selectionHighlight.OutlineColor = Color3.fromRGB(150,220,255)
+        selectionHighlight.OutlineTransparency = 0.1
+        selectionHighlight.Adornee = hum.Parent
+        selectionHighlight.Parent = gui
+        setStatus("Selected: " .. hum.Parent.Name .. "  (press F to view)", COL.accent)
+    end
+end
+
+local function spectateTarget(hum)
+    if not hum or not hum.Parent then return end
+    if not savedCameraType then
+        savedCameraType = Camera.CameraType
+        savedCameraSubject = Camera.CameraSubject
+    end
+    spectating = true
+    Camera.CameraType = Enum.CameraType.Custom
+    Camera.CameraSubject = hum
+    setStatus("Spectating: " .. hum.Parent.Name, COL.good)
+end
+
+local function stopSpectate()
+    if not spectating then return end
+    spectating = false
+    Camera.CameraType = savedCameraType or Enum.CameraType.Custom
+    if savedCameraSubject then
+        Camera.CameraSubject = savedCameraSubject
+    elseif player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
+        Camera.CameraSubject = player.Character:FindFirstChildOfClass("Humanoid")
+    end
+    savedCameraType = nil
+    savedCameraSubject = nil
+    setStatus("Stopped spectating", COL.good)
+end
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if Freecam.enabled then return end
+    if UserInputService:GetFocusedTextBox() then return end
+
+    local mouseLoc = UserInputService:GetMouseLocation()
+    local unitRay = Camera:ViewportPointToRay(mouseLoc.X, mouseLoc.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {player.Character, gui}
+    local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * 500, params)
+
+    if result and result.Instance then
+        local model = result.Instance:FindFirstAncestorOfClass("Model")
+        if model then
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            if hum and hum ~= player.Character:FindFirstChildOfClass("Humanoid") then
+                setSelection(hum)
+                return
+            end
+        end
+    end
+    setSelection(nil)
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- MAP SNAPSHOT (v13)
+--
+-- This is intended for maps/games you own or are authorized to export.
+-- It saves a visual/physical description of supported Workspace objects so
+-- a replay can rebuild the environment in a dedicated replay viewer place.
+-- Scripts are NEVER copied or executed. Terrain is not serialized because a
+-- client-side replay file cannot safely/compactly preserve arbitrary terrain.
+--
+-- Supported well: Parts, MeshParts, Models/Folders, decals/textures,
+-- SpecialMeshes, SurfaceAppearances, Attachments and common visual emitters.
+-- Unsupported/protected asset properties are simply skipped.
+-- ══════════════════════════════════════════════════════════
+local function mapColor3(c)
+    if typeof(c) == "Color3" then
+        return {sanitizeNumber(c.R), sanitizeNumber(c.G), sanitizeNumber(c.B)}
+    end
+    return {1,1,1}
+end
+
+local function color3FromMap(v)
+    if type(v) ~= "table" then return Color3.new(1,1,1) end
+    return Color3.new(
+        math.clamp(tonumber(v[1]) or 1, 0, 1),
+        math.clamp(tonumber(v[2]) or 1, 0, 1),
+        math.clamp(tonumber(v[3]) or 1, 0, 1)
+    )
+end
+
+local function mapVec(v)
+    return safeVec(v)
+end
+
+local function vec3FromMap(v, fallback)
+    fallback = fallback or Vector3.zero
+    if type(v) ~= "table" then return fallback end
+    return Vector3.new(tonumber(v[1]) or fallback.X, tonumber(v[2]) or fallback.Y, tonumber(v[3]) or fallback.Z)
+end
+
+local function isCharacterDescendant(obj)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character and obj:IsDescendantOf(p.Character) then
+            return true
+        end
+    end
+    return false
+end
+
+local function shouldSnapshotMapObject(obj)
+    if obj == workspace.CurrentCamera or obj:IsDescendantOf(workspace.CurrentCamera) then return false end
+    if obj:IsDescendantOf(workspace.Terrain) then return false end
+    if isCharacterDescendant(obj) then return false end
+    if obj:IsDescendantOf(gui) then return false end
+    -- The source game's actual baseplate is part of the map snapshot.
+    -- The viewer-place baseplate is hidden separately when snapshot playback is used.
+    local replayMapRoot = workspace:FindFirstChild("__ReplayMap")
+    if obj.Name == "__ReplayMap" or (replayMapRoot and obj:IsDescendantOf(replayMapRoot)) then return false end
+
+    -- Never export executable objects.
+    if obj:IsA("Script") or obj:IsA("LocalScript") or obj:IsA("ModuleScript") then return false end
+    return true
+end
+
+local function captureMapSnapshot()
+    local root = {version = 1, objectCount = 0, objects = {}, sourcePlaceId = game.PlaceId, sourceGameName = getPlaceName()}
+    local idByInstance = {}
+    local pending = {}
+
+    -- Build a deterministic list. We include only useful container/render objects.
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if shouldSnapshotMapObject(obj) then
+            local include = obj:IsA("Model") or obj:IsA("Folder") or obj:IsA("BasePart")
+                or obj:IsA("Decal") or obj:IsA("Texture") or obj:IsA("SpecialMesh")
+                or obj:IsA("SurfaceAppearance") or obj:IsA("Attachment")
+                or obj:IsA("ParticleEmitter") or obj:IsA("Beam") or obj:IsA("Trail")
+                or obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight")
+            if include then table.insert(pending, obj) end
+        end
+    end
+
+    -- Stable order: shallow parents first, then children.
+    table.sort(pending, function(a,b)
+        local da, db = 0, 0
+        local x = a.Parent while x and x ~= workspace do da += 1; x = x.Parent end
+        x = b.Parent while x and x ~= workspace do db += 1; x = x.Parent end
+        if da == db then return a:GetFullName() < b:GetFullName() end
+        return da < db
+    end)
+
+    local nextId = 0
+    local maxObjects = 12000 -- keep replay JSON usable
+    for _, obj in ipairs(pending) do
+        if nextId >= maxObjects then break end
+        local parent = obj.Parent
+        local parentId = idByInstance[parent] or 0
+        nextId += 1
+        idByInstance[obj] = nextId
+
+        local rec = {
+            id = nextId,
+            parent = parentId,
+            class = obj.ClassName,
+            name = obj.Name,
+        }
+
+        if obj:IsA("BasePart") then
+            rec.cframe = safeCFrameComponents(obj.CFrame)
+            rec.size = mapVec(obj.Size)
+            rec.color = mapColor3(obj.Color)
+            rec.transparency = sanitizeNumber(obj.Transparency)
+            rec.reflectance = sanitizeNumber(obj.Reflectance)
+            rec.material = obj.Material.Name
+            rec.materialVariant = tostring(obj.MaterialVariant or "")
+            rec.anchored = obj.Anchored
+            rec.canCollide = obj.CanCollide
+            rec.canQuery = obj.CanQuery
+            rec.canTouch = obj.CanTouch
+            rec.massless = obj.Massless
+            rec.castShadow = obj.CastShadow
+            if obj:IsA("Part") then
+                rec.shape = obj.Shape.Name
+                rec.topSurface = obj.TopSurface.Name
+                rec.bottomSurface = obj.BottomSurface.Name
+            end
+            if obj:IsA("MeshPart") then
+                pcall(function() rec.meshId = obj.MeshId end)
+                pcall(function() rec.textureId = obj.TextureID end)
+                pcall(function() rec.renderFidelity = obj.RenderFidelity.Name end)
+                pcall(function() rec.collisionFidelity = obj.CollisionFidelity.Name end)
+            end
+        elseif obj:IsA("Decal") or obj:IsA("Texture") then
+            rec.texture = obj.Texture
+            rec.transparency = sanitizeNumber(obj.Transparency)
+            rec.color = mapColor3(obj.Color3)
+            rec.face = obj.Face.Name
+            if obj:IsA("Texture") then
+                rec.studsPerTileU = sanitizeNumber(obj.StudsPerTileU)
+                rec.studsPerTileV = sanitizeNumber(obj.StudsPerTileV)
+                rec.offsetStudsU = sanitizeNumber(obj.OffsetStudsU)
+                rec.offsetStudsV = sanitizeNumber(obj.OffsetStudsV)
+            end
+        elseif obj:IsA("SpecialMesh") then
+            rec.meshType = obj.MeshType.Name
+            rec.meshId = obj.MeshId
+            rec.textureId = obj.TextureId
+            rec.scale = mapVec(obj.Scale)
+            rec.offset = mapVec(obj.Offset)
+            rec.vertexColor = mapColor3(obj.VertexColor)
+        elseif obj:IsA("SurfaceAppearance") then
+            pcall(function() rec.colorMap = obj.ColorMap end)
+            pcall(function() rec.normalMap = obj.NormalMap end)
+            pcall(function() rec.metalnessMap = obj.MetalnessMap end)
+            pcall(function() rec.roughnessMap = obj.RoughnessMap end)
+            pcall(function() rec.alphaMode = obj.AlphaMode.Name end)
+        elseif obj:IsA("Attachment") then
+            rec.cframe = safeCFrameComponents(obj.CFrame)
+            rec.visible = obj.Visible
+        elseif obj:IsA("ParticleEmitter") then
+            rec.texture = obj.Texture
+            rec.rate = sanitizeNumber(obj.Rate)
+            rec.lifetimeMin = sanitizeNumber(obj.Lifetime.Min)
+            rec.lifetimeMax = sanitizeNumber(obj.Lifetime.Max)
+            rec.speedMin = sanitizeNumber(obj.Speed.Min)
+            rec.speedMax = sanitizeNumber(obj.Speed.Max)
+            rec.enabled = obj.Enabled
+        elseif obj:IsA("Beam") or obj:IsA("Trail") then
+            rec.texture = obj.Texture
+            rec.enabled = obj.Enabled
+        elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+            rec.color = mapColor3(obj.Color)
+            rec.brightness = sanitizeNumber(obj.Brightness)
+            rec.range = sanitizeNumber(obj.Range)
+            rec.enabled = obj.Enabled
+            if obj:IsA("SpotLight") then rec.angle = sanitizeNumber(obj.Angle) end
+        end
+
+        table.insert(root.objects, rec)
+    end
+    root.objectCount = #root.objects
+    root.truncated = (#pending > #root.objects)
+    return root
+end
+
+local function setMapProperty(obj, prop, value)
+    if value == nil then return end
+    pcall(function() obj[prop] = value end)
+end
+
+local function hideGameplayWorld()
+    replayHiddenWorldParts = {}
+    local replayRoot = workspace:FindFirstChild("__ReplayMap")
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and not (replayRoot and obj:IsDescendantOf(replayRoot)) then
+            if not player.Character or not obj:IsDescendantOf(player.Character) then
+                -- LocalTransparencyModifier is client-only, so the real game is
+                -- restored exactly when the replay ends.
+                replayHiddenWorldParts[obj] = {
+                    transparency = obj.LocalTransparencyModifier,
+                    canCollide = obj.CanCollide,
+                    canQuery = obj.CanQuery,
+                    canTouch = obj.CanTouch,
+                }
+                obj.LocalTransparencyModifier = 1
+                obj.CanCollide = false
+                obj.CanQuery = false
+                obj.CanTouch = false
+            end
+        end
+    end
+end
+
+local function restoreGameplayWorld()
+    for obj, state in pairs(replayHiddenWorldParts) do
+        if obj and obj.Parent then
+            pcall(function()
+                obj.LocalTransparencyModifier = state.transparency or 0
+                obj.CanCollide = state.canCollide ~= false
+                obj.CanQuery = state.canQuery ~= false
+                obj.CanTouch = state.canTouch ~= false
+            end)
+        end
+    end
+    replayHiddenWorldParts = {}
+end
+
+local function restoreMapSnapshot(snapshot)
+    if type(snapshot) ~= "table" or type(snapshot.objects) ~= "table" then
+        setStatus("Replay has no map snapshot", COL.warn)
+        return false
+    end
+
+    local old = workspace:FindFirstChild("__ReplayMap")
+    if old then old:Destroy() end
+
+    local root = Instance.new("Folder")
+    root.Name = "__ReplayMap"
+    root.Parent = workspace
+
+    local byId = {[0] = root}
+    local records = snapshot.objects
+    local created = 0
+
+    for _, rec in ipairs(records) do
+        if type(rec) == "table" then
+            local parent = byId[tonumber(rec.parent) or 0] or root
+            local obj
+            local class = tostring(rec.class or "Folder")
+
+            -- Only instantiate safe, visual/physical classes. Never scripts.
+            local allowed = {
+                Model=true, Folder=true, Part=true, MeshPart=true, WedgePart=true,
+                CornerWedgePart=true, TrussPart=true, Decal=true, Texture=true,
+                SpecialMesh=true, SurfaceAppearance=true, Attachment=true,
+                ParticleEmitter=true, Beam=true, Trail=true,
+                PointLight=true, SpotLight=true, SurfaceLight=true,
+            }
+            if not allowed[class] then class = "Part" end
+
+            local ok = pcall(function() obj = Instance.new(class) end)
+            if not ok or not obj then
+                obj = Instance.new(class == "Model" and "Model" or "Part")
+            end
+            obj.Name = tostring(rec.name or class)
+            obj.Parent = parent
+            byId[rec.id] = obj
+            created += 1
+
+            if obj:IsA("BasePart") then
+                obj.CFrame = cframeFromSerialized(rec.cframe)
+                obj.Size = vec3FromMap(rec.size, Vector3.new(1,1,1))
+                obj.Color = color3FromMap(rec.color)
+                setMapProperty(obj, "Transparency", tonumber(rec.transparency) or 0)
+                setMapProperty(obj, "Reflectance", tonumber(rec.reflectance) or 0)
+                setMapProperty(obj, "Anchored", rec.anchored ~= false)
+                setMapProperty(obj, "CanCollide", rec.canCollide ~= false)
+                setMapProperty(obj, "CanQuery", rec.canQuery ~= false)
+                setMapProperty(obj, "CanTouch", rec.canTouch ~= false)
+                setMapProperty(obj, "Massless", rec.massless == true)
+                setMapProperty(obj, "CastShadow", rec.castShadow ~= false)
+                if rec.material then
+                    pcall(function() obj.Material = Enum.Material[rec.material] end)
+                end
+                if rec.materialVariant and rec.materialVariant ~= "" then
+                    setMapProperty(obj, "MaterialVariant", rec.materialVariant)
+                end
+                if obj:IsA("Part") and rec.shape then
+                    pcall(function() obj.Shape = Enum.PartType[rec.shape] end)
+                end
+                if obj:IsA("MeshPart") then
+                    if rec.meshId then setMapProperty(obj, "MeshId", rec.meshId) end
+                    if rec.textureId then setMapProperty(obj, "TextureID", rec.textureId) end
+                    if rec.renderFidelity then pcall(function() obj.RenderFidelity = Enum.RenderFidelity[rec.renderFidelity] end) end
+                    if rec.collisionFidelity then pcall(function() obj.CollisionFidelity = Enum.CollisionFidelity[rec.collisionFidelity] end) end
+                end
+            elseif obj:IsA("Decal") or obj:IsA("Texture") then
+                setMapProperty(obj, "Texture", rec.texture or "")
+                setMapProperty(obj, "Transparency", tonumber(rec.transparency) or 0)
+                setMapProperty(obj, "Color3", color3FromMap(rec.color))
+                if rec.face then pcall(function() obj.Face = Enum.NormalId[rec.face] end) end
+                if obj:IsA("Texture") then
+                    setMapProperty(obj, "StudsPerTileU", tonumber(rec.studsPerTileU) or 1)
+                    setMapProperty(obj, "StudsPerTileV", tonumber(rec.studsPerTileV) or 1)
+                    setMapProperty(obj, "OffsetStudsU", tonumber(rec.offsetStudsU) or 0)
+                    setMapProperty(obj, "OffsetStudsV", tonumber(rec.offsetStudsV) or 0)
+                end
+            elseif obj:IsA("SpecialMesh") then
+                if rec.meshType then pcall(function() obj.MeshType = Enum.MeshType[rec.meshType] end) end
+                setMapProperty(obj, "MeshId", rec.meshId or "")
+                setMapProperty(obj, "TextureId", rec.textureId or "")
+                setMapProperty(obj, "Scale", vec3FromMap(rec.scale, Vector3.new(1,1,1)))
+                setMapProperty(obj, "Offset", vec3FromMap(rec.offset, Vector3.zero))
+                setMapProperty(obj, "VertexColor", color3FromMap(rec.vertexColor))
+            elseif obj:IsA("SurfaceAppearance") then
+                setMapProperty(obj, "ColorMap", rec.colorMap)
+                setMapProperty(obj, "NormalMap", rec.normalMap)
+                setMapProperty(obj, "MetalnessMap", rec.metalnessMap)
+                setMapProperty(obj, "RoughnessMap", rec.roughnessMap)
+                if rec.alphaMode then pcall(function() obj.AlphaMode = Enum.AlphaMode[rec.alphaMode] end) end
+            elseif obj:IsA("Attachment") then
+                obj.CFrame = cframeFromSerialized(rec.cframe)
+                setMapProperty(obj, "Visible", rec.visible == true)
+            elseif obj:IsA("ParticleEmitter") then
+                setMapProperty(obj, "Texture", rec.texture or "")
+                setMapProperty(obj, "Rate", tonumber(rec.rate) or 0)
+                setMapProperty(obj, "Enabled", rec.enabled == true)
+            elseif obj:IsA("Beam") or obj:IsA("Trail") then
+                setMapProperty(obj, "Texture", rec.texture or "")
+                setMapProperty(obj, "Enabled", rec.enabled == true)
+            elseif obj:IsA("PointLight") or obj:IsA("SpotLight") or obj:IsA("SurfaceLight") then
+                setMapProperty(obj, "Color", color3FromMap(rec.color))
+                setMapProperty(obj, "Brightness", tonumber(rec.brightness) or 1)
+                setMapProperty(obj, "Range", tonumber(rec.range) or 8)
+                setMapProperty(obj, "Enabled", rec.enabled ~= false)
+                if obj:IsA("SpotLight") and rec.angle then setMapProperty(obj, "Angle", tonumber(rec.angle) or 90) end
+            end
+        end
+    end
+
+    setStatus(string.format("Map loaded • %d objects%s", created, snapshot.truncated and " • truncated" or ""), COL.good)
+    return true
+end
+
+local function clearReplayMap()
+    local old = workspace:FindFirstChild("__ReplayMap")
+    if old then old:Destroy() end
+end
+
+-- ══════════════════════════════════════════════════════════
+-- CLIENT UI RECORDING (visual-only; no scripts/events are copied)
+-- ══════════════════════════════════════════════════════════
+local UI_CLASSES = {
+    ScreenGui=true, Frame=true, TextLabel=true, TextButton=true, TextBox=true,
+    ImageLabel=true, ImageButton=true, ScrollingFrame=true, ViewportFrame=true,
+    CanvasGroup=true, UIListLayout=true, UIGridLayout=true, UIPadding=true,
+    UICorner=true, UIStroke=true, UIAspectRatioConstraint=true,
+    UISizeConstraint=true, UITextSizeConstraint=true, UIPageLayout=true,
+}
+
+local function packUIValue(v)
+    local t = typeof(v)
+    if t == "Color3" then return {__t="Color3", v={v.R,v.G,v.B}} end
+    if t == "UDim2" then return {__t="UDim2", v={v.X.Scale,v.X.Offset,v.Y.Scale,v.Y.Offset}} end
+    if t == "UDim" then return {__t="UDim", v={v.Scale,v.Offset}} end
+    if t == "Vector2" then return {__t="Vector2", v={v.X,v.Y}} end
+    if t == "EnumItem" then return {__t="Enum", e=tostring(v.EnumType), n=v.Name} end
+    if type(v) == "string" or type(v) == "number" or type(v) == "boolean" then return v end
+    return nil
+end
+
+local function unpackUIValue(v)
+    if type(v) ~= "table" or not v.__t then return v end
+    local a = v.v or {}
+    if v.__t == "Color3" then return Color3.new(a[1] or 1,a[2] or 1,a[3] or 1) end
+    if v.__t == "UDim2" then return UDim2.new(a[1] or 0,a[2] or 0,a[3] or 0,a[4] or 0) end
+    if v.__t == "UDim" then return UDim.new(a[1] or 0,a[2] or 0) end
+    if v.__t == "Vector2" then return Vector2.new(a[1] or 0,a[2] or 0) end
+    if v.__t == "Enum" then
+        local enumName = tostring(v.e or ""):match("Enum%.(.+)")
+        if enumName and Enum[enumName] then return Enum[enumName][v.n] end
+    end
+    return nil
+end
+
+local UI_PROPERTIES = {
+    "Name","Visible","Enabled","DisplayOrder","IgnoreGuiInset","ResetOnSpawn",
+    "Size","Position","AnchorPoint","Rotation","BackgroundColor3","BackgroundTransparency",
+    "BorderColor3","BorderSizePixel","ZIndex","ClipsDescendants","LayoutOrder",
+    "Text","TextColor3","TextTransparency","TextStrokeColor3","TextStrokeTransparency",
+    "TextSize","TextScaled","TextWrapped","RichText","Font","FontFace","TextXAlignment","TextYAlignment",
+    "Image","ImageColor3","ImageTransparency","ScaleType","SliceCenter","SliceScale",
+    "CanvasSize","CanvasPosition","AutomaticCanvasSize","ScrollBarThickness","ScrollingDirection",
+    "FillDirection","HorizontalAlignment","VerticalAlignment","Padding","SortOrder","CellSize","CellPadding",
+    "CornerRadius","Thickness","Color","Transparency","ApplyStrokeMode","AspectRatio","DominantAxis",
+    "MinSize","MaxSize","MaxTextSize","MinTextSize","AutomaticSize","GroupTransparency",
+}
+
+local function captureUIObject(obj, parentId, counter)
+    if not UI_CLASSES[obj.ClassName] then return nil end
+    counter.n += 1
+    if counter.n > 900 then return nil end
+    local node = {id=counter.n,parent=parentId,class=obj.ClassName,name=obj.Name,props={},children={}}
+    for _, prop in ipairs(UI_PROPERTIES) do
+        local ok, value = pcall(function() return obj[prop] end)
+        if ok then
+            local packed = packUIValue(value)
+            if packed ~= nil then node.props[prop] = packed end
+        end
+    end
+    for _, child in ipairs(obj:GetChildren()) do
+        local childNode = captureUIObject(child,node.id,counter)
+        if childNode then table.insert(node.children,childNode) end
+    end
+    return node
+end
+
+local function captureClientUI(now)
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return nil end
+    local snap = {time=now, roots={}}
+    local counter = {n=0}
+    for _, child in ipairs(pg:GetChildren()) do
+        if child:IsA("ScreenGui") and child.Name ~= "ReplayModUI" and child.Name ~= "__ReplayRecordedUI" then
+            local node = captureUIObject(child,0,counter)
+            if node then table.insert(snap.roots,node) end
+        end
+    end
+    return snap
+end
+
+local function destroyReplayUIOverlay()
+    if replayUIOverlay then pcall(function() replayUIOverlay:Destroy() end) end
+    replayUIOverlay = nil
+end
+
+local function buildUIObject(node,parent)
+    if type(node) ~= "table" or not UI_CLASSES[node.class] then return nil end
+    local ok,obj = pcall(Instance.new,node.class)
+    if not ok or not obj then return nil end
+    for prop, packed in pairs(node.props or {}) do
+        local value = unpackUIValue(packed)
+        if value ~= nil then pcall(function() obj[prop] = value end) end
+    end
+    obj.Name = tostring(node.name or node.class)
+    -- Do not run copied UI scripts or event logic; only the saved visual tree is rebuilt.
+    obj.Parent = parent
+    for _, child in ipairs(node.children or {}) do buildUIObject(child,obj) end
+    return obj
+end
+
+local function setLiveScreenGuisEnabled(enabled)
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    for _, child in ipairs(pg:GetChildren()) do
+        if child:IsA("ScreenGui") and child.Name ~= "ReplayModUI" and child.Name ~= "__ReplayRecordedUI" then
+            if enabled then
+                if savedScreenGuiStates[child] ~= nil then child.Enabled = savedScreenGuiStates[child] end
+            else
+                if savedScreenGuiStates[child] == nil then savedScreenGuiStates[child] = child.Enabled end
+                child.Enabled = false
+            end
+        end
+    end
+    if enabled then savedScreenGuiStates = {} end
+end
+
+local function applyRecordedUIAt(t)
+    if not replayUIEnabled or not currentReplay or not currentReplay.uiSnapshots or #currentReplay.uiSnapshots == 0 then
+        destroyReplayUIOverlay()
+        return
+    end
+    local chosen = currentReplay.uiSnapshots[1]
+    for _, snap in ipairs(currentReplay.uiSnapshots) do
+        if (snap.time or 0) <= t then chosen = snap else break end
+    end
+    if not chosen then return end
+    local key = tostring(chosen.time or 0)
+    if replayUIOverlay and replayUIOverlay:GetAttribute("ReplaySnapshotTime") == key then return end
+    destroyReplayUIOverlay()
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    local overlay = Instance.new("ScreenGui")
+    overlay.Name = "__ReplayRecordedUI"
+    overlay.ResetOnSpawn = false
+    overlay.IgnoreGuiInset = true
+    overlay.DisplayOrder = 100000
+    overlay:SetAttribute("ReplaySnapshotTime",key)
+    overlay.Parent = pg
+    replayUIOverlay = overlay
+    -- ScreenGui cannot be nested reliably inside another ScreenGui, so merge
+    -- each captured ScreenGui's visual children into this replay overlay.
+    local firstRoot = (chosen.roots or {})[1]
+    if firstRoot and firstRoot.props then
+        local inset = unpackUIValue(firstRoot.props.IgnoreGuiInset)
+        local order = unpackUIValue(firstRoot.props.DisplayOrder)
+        if type(inset) == "boolean" then overlay.IgnoreGuiInset = inset end
+        if type(order) == "number" then overlay.DisplayOrder = math.max(1000, order) end
+    end
+    for _, root in ipairs(chosen.roots or {}) do
+        for _, child in ipairs(root.children or {}) do buildUIObject(child,overlay) end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════
+-- RECORDING
+-- ══════════════════════════════════════════════════════════
+local function snapshotAvatarClone(uid, char)
+    if not char then return end
+    local ok, clone = pcall(function()
+        char.Archivable = true
+        return char:Clone()
+    end)
+    if ok and clone then
+        clone.Parent = nil
+        if recordedAvatarClones[uid] and recordedAvatarClones[uid].Parent then
+            recordedAvatarClones[uid]:Destroy()
+        end
+        recordedAvatarClones[uid] = clone
+    end
+end
+
+local function recordAppearanceEvent(uid, char, atTime)
+    if not char then return end
+    local appearance = captureAvatarAppearance(char)
+    recordedAppearances[uid] = appearance or recordedAppearances[uid]
+    recordedRigTypes[uid] = getRigType(char)
+    snapshotAvatarClone(uid, char)
+    if appearance then
+        recordedAppearanceEvents[uid] = recordedAppearanceEvents[uid] or {}
+        local events = recordedAppearanceEvents[uid]
+        local event = {time = math.max(0, tonumber(atTime) or 0), appearance = appearance, rigType = recordedRigTypes[uid].Name}
+        if #events > 0 and math.abs((events[#events].time or 0) - event.time) < 0.08 then
+            events[#events] = event
+        else
+            table.insert(events, event)
+        end
+    end
+end
+
+local function startRec()
+    if isRecording or isPlaying then return end
+    isRecording = true
+    recordedPlayers, recordedRigTypes, recordedLocalCamera, lastKnown = {}, {}, {}, {}
+    recordedAppearances = {}
+    recordedAppearanceEvents = {}
+    recordedAvatarClones = {}
+    recordedMapSnapshot = nil
+    recordedUISnapshots = {}
+    lastUISnapshotTime = -1
+    lastRespawnTime = {}
+    recStartTime = tick(); lastRecTime = 0
+    currentPlaceInfo = { placeId = game.PlaceId, gameName = getPlaceName(), jobId = game.JobId }
+    local okInitialUI, initialUISnapshot = pcall(captureClientUI, 0)
+    if okInitialUI and initialUISnapshot then
+        table.insert(recordedUISnapshots, initialUISnapshot)
+        lastUISnapshotTime = 0
+    end
+
+    -- Capture the map once at the beginning. This is for your own/authorized
+    -- maps and is intentionally limited to non-script visual/physical objects.
+    local mapStart = tick()
+    local okMap, mapData = pcall(captureMapSnapshot)
+    if okMap then
+        recordedMapSnapshot = mapData
+        setStatus(string.format("Map snapshot: %d objects", mapData.objectCount or 0), COL.good)
+    else
+        warn("[ReplayMod v13] Map snapshot failed:", mapData)
+        setStatus("Map snapshot failed — recording players anyway", COL.warn)
+    end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        recordedPlayers[p.UserId] = {name = p.Name, userId = p.UserId, frames = {}}
+        if p.Character then
+            recordAppearanceEvent(p.UserId, p.Character, 0)
+        end
+    end
+
+    recBtn.Text = "⏺  Recording…"
+    recBtn.BackgroundColor3 = Color3.fromRGB(140,30,30)
+    setStatus("Recording in " .. currentPlaceInfo.gameName, COL.bad)
+end
+
+local function stopRec()
+    if not isRecording then return end
+    isRecording = false
+    local dur = tick() - recStartTime
+    recBtn.Text = "⏺  Start Recording"
+    recBtn.BackgroundColor3 = Color3.fromRGB(210,55,55)
+
+    -- v15.1-compatible cleanup: stopping a recording always gives the mouse
+    -- back unless a replay/freecam session is currently using it.
+    if not isPlaying and not Freecam.enabled then
+        pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+        pcall(function() UserInputService.MouseIconEnabled = true end)
+    end
+
+    if dur < 0.5 then setStatus("Too short", COL.warn); return end
+
+    currentReplay = {
+        duration = dur, players = recordedPlayers,
+        appearances = recordedAppearances,
+        runtimeAvatarClones = recordedAvatarClones,
+        localCamera = recordedLocalCamera,
+        timestamp = os.time(),
+        placeId = currentPlaceInfo.placeId, gameName = currentPlaceInfo.gameName,
+        jobId = currentPlaceInfo.jobId, version = FILE_VERSION,
+        mapSnapshot = recordedMapSnapshot,
+        uiSnapshots = recordedUISnapshots,
+        appearanceEvents = recordedAppearanceEvents,
+    }
+    setStatus(string.format("Recorded %.1fs — Play to view", dur), COL.accent)
+end
+
+recBtn.MouseButton1Click:Connect(function() if isRecording then stopRec() else startRec() end end)
+recStop.MouseButton1Click:Connect(stopRec)
+
+RunService.Heartbeat:Connect(function()
+    if not isRecording then return end
+    local now = tick() - recStartTime
+    if now - lastRecTime < RECORD_RATE then return end
+    lastRecTime = now
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if not recordedPlayers[p.UserId] then
+            recordedPlayers[p.UserId] = {name = p.Name, userId = p.UserId, frames = {}}
+            if p.Character then
+                recordAppearanceEvent(p.UserId, p.Character, now)
+            end
+        end
+        if p.Character and not recordedAppearances[p.UserId] then
+            recordAppearanceEvent(p.UserId, p.Character, now)
+        end
+        local f = captureFrame(p.Character)
+        if f then
+            f.time = now
+            lastKnown[p.UserId] = f
+            table.insert(recordedPlayers[p.UserId].frames, f)
+        elseif lastKnown[p.UserId] then
+            local last = lastKnown[p.UserId]
+            table.insert(recordedPlayers[p.UserId].frames, {
+                time = now,
+                position = last.position, rotation = last.rotation,
+                health = 0, maxHealth = last.maxHealth or 100,
+                hipHeight = last.hipHeight,
+                dead = true, animations = {}, accessories = last.accessories or {},
+            })
+        end
+    end
+    table.insert(recordedLocalCamera, {time = now, cframe = Camera.CFrame})
+    -- Full visual-only client UI snapshots once per second; capped to limit replay size.
+    if now - lastUISnapshotTime >= 1 and #recordedUISnapshots < 600 then
+        lastUISnapshotTime = now
+        local okUI, uiSnap = pcall(captureClientUI, now)
+        if okUI and uiSnap then table.insert(recordedUISnapshots, uiSnap) end
+    end
+end)
+
+Players.PlayerAdded:Connect(function(p)
+    if isRecording then
+        recordedPlayers[p.UserId] = {name = p.Name, userId = p.UserId, frames = {}}
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+    if isRecording and recordedPlayers[p.UserId] then
+        -- Leave their frames intact so the replay still contains their exit.
+        lastKnown[p.UserId] = lastKnown[p.UserId]
+    end
+end)
+
+player.CharacterAdded:Connect(function(char)
+    if isRecording then
+        recordAppearanceEvent(player.UserId, char, tick() - recStartTime)
+        lastRespawnTime[player.UserId] = tick() - recStartTime
+    end
+    -- Re-apply the setting after respawns.
+    if hideSelfEnabled and isPlaying then
+        task.defer(function()
+            if char == player.Character then
+                hideSelfChar()
+            end
+        end)
+    end
+end)
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= player then
+        p.CharacterAdded:Connect(function(char)
+            if isRecording then
+                recordAppearanceEvent(p.UserId, char, tick() - recStartTime)
+                lastRespawnTime[p.UserId] = tick() - recStartTime
+            end
+            if isPlaying or realHidden then
+                task.defer(function()
+                    if p.Character == char and not hiddenPlayers[p.UserId] then
+                        hiddenPlayers[p.UserId] = hideChar(char)
+                    end
+                end)
+            end
+        end)
+    end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function(char)
+        if isRecording then
+            recordAppearanceEvent(p.UserId, char, tick() - recStartTime)
+        end
+        if isPlaying or realHidden then
+            task.defer(function()
+                if p.Character == char and p ~= player and not hiddenPlayers[p.UserId] then
+                    hiddenPlayers[p.UserId] = hideChar(char)
+                end
+            end)
+        end
+    end)
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- PLAYBACK
+-- ══════════════════════════════════════════════════════════
+local function updateHUD()
+    local dur = currentReplay and currentReplay.duration or 0
+    tbarPlay.Text = isPaused and "▶" or "⏸"
+    tbarCur.Text = fmtTime(replayTime)
+    tbarTot.Text = fmtTime(dur)
+    if dur > 0 then
+        local pct = math.clamp(replayTime / dur, 0, 1)
+        tbarFill.Size = UDim2.new(pct, 0, 1, 0)
+        tbarPlayhead.Position = UDim2.new(pct, -2, 0, -3)
+        timelineFill.Size = UDim2.new(pct, 0, 1, 0)
+    end
+    timeLbl.Text = fmtTime(replayTime) .. " / " .. fmtTime(dur)
+end
+
+local function setPaused(p)
+    isPaused = p
+    pauseOverlay.Visible = p and not uiHidden
+    updateHUD()
+    if p then
+        for _, tracks in pairs(replayAnimTracks) do
+            for _, t in pairs(tracks) do pcall(function() t:AdjustSpeed(0) end) end
+        end
+    end
+end
+
+local function beginPlayback()
+    if Freecam.enabled then Freecam.Stop() end
+    if not currentReplay then setStatus("No replay loaded", COL.warn); return end
+    if isPlaying then return end
+
+    isPlaying = true
+
+    -- Enter Studio Mode using the original v15.1 tab system.
+    -- No new input services, CoreGui APIs, or render-step bindings are used.
+    for n, c in pairs(tabContents) do
+        c.Visible = (n == "Studio")
+    end
+    for n, b in pairs(tabs) do
+        b.BackgroundColor3 = (n == "Studio") and COL.accent or COL.panel
+        b.TextColor3 = (n == "Studio") and Color3.new(1,1,1) or COL.sub
+    end
+    activeTab = "Studio"
+
+    -- Replay Mod starts PAUSED, like a replay editor/timeline.
+    -- Press Space or the play button to actually run the timeline.
+    isPaused = true
+    replayTime = 0
+    replayCursorUnlocked = false
+    appliedAppearanceEventIndex = {}
+    appearanceReloading = {}
+    clearGhosts()
+    stopAllAnims()
+
+    -- Map mode:
+    --   Use Gameplay Map = keep the actual game's map/baseplate visible.
+    --   Off = hide the live map and rebuild the saved map snapshot instead.
+    clearReplayMap()
+    restoreGameplayWorld()
+    if useGameplayMap then
+        setStatus("Gameplay map enabled • replay paused", COL.accent)
+    elseif currentReplay.mapSnapshot then
+        hideGameplayWorld()
+        local okMap, errMap = pcall(restoreMapSnapshot, currentReplay.mapSnapshot)
+        if not okMap then
+            warn("[ReplayMod v15] Map restore failed:", errMap)
+            setStatus("Map restore failed — continuing replay", COL.warn)
+        end
+    else
+        setStatus("No saved map • using gameplay map", COL.warn)
+    end
+
+    -- Clone currently loaded characters BEFORE hiding the real ones. This gives
+    -- playback an immediate, fully-dressed avatar even if avatar web APIs fail.
+    local liveClones = {}
+    for uid, pd in pairs(currentReplay.players) do
+        local livePlayer = Players:GetPlayerByUserId(uid)
+        local char = livePlayer and livePlayer.Character
+        if char then
+            pcall(function()
+                char.Archivable = true
+                local clone = char:Clone()
+                if clone then liveClones[uid] = clone end
+            end)
+        end
+        if not liveClones[uid] and currentReplay.runtimeAvatarClones and currentReplay.runtimeAvatarClones[uid] then
+            pcall(function()
+                local source = currentReplay.runtimeAvatarClones[uid]
+                source.Archivable = true
+                local clone = source:Clone()
+                if clone then liveClones[uid] = clone end
+            end)
+        end
+    end
+
+    hideAllReal()
+    if hideSelfEnabled then hideSelfChar() end
+    if replayUIEnabled and currentReplay.uiSnapshots and #currentReplay.uiSnapshots > 0 then
+        setLiveScreenGuisEnabled(false)
+        applyRecordedUIAt(0)
+    end
+
+    -- Lock the cursor during replay. Hold Alt to temporarily unlock it so the
+    -- mouse can interact with the replay UI.
+    replaySavedMouseBehavior = UserInputService.MouseBehavior
+    replaySavedMouseIcon = UserInputService.MouseIconEnabled
+    UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+    UserInputService.MouseIconEnabled = false
+
+    playBtn.Text = "▶  Stop"
+    playBtn.BackgroundColor3 = Color3.fromRGB(155,60,60)
+    tbar.Visible = not uiHidden
+    pauseOverlay.Visible = not uiHidden
+    updateHUD()
+    setStatus("Paused — Space / ▶ to play • hold Alt for cursor", COL.accent)
+
+    local loadedCount, totalCount = 0, 0
+    local entries = {}
+
+    for uid, pd in pairs(currentReplay.players) do
+        if pd and #pd.frames > 0 then
+            table.insert(entries, {uid = uid, pd = pd})
+            totalCount = totalCount + 1
+        end
+    end
+
+    loadIndicator.Visible = true
+    loadLabel.Text = "Loading players…  0/" .. totalCount
+
+    -- Create every avatar immediately. Prefer a clone of the player's live
+    -- character because it already contains hats/accessories/body colors and
+    -- does not depend on the avatar web API.
+    for _, entry in ipairs(entries) do
+        local uid, pd = entry.uid, entry.pd
+        local ghost = liveClones[uid]
+
+        if ghost then
+            ghost.Name = pd.name
+            ghost.Parent = workspace
+            setupGhost(ghost, uid, recordedRigTypes[uid], pd.frames[1])
+        else
+            ghost = createPlaceholder(pd.name, recordedRigTypes[uid] or Enum.HumanoidRigType.R15)
+        end
+
+        replayCharacters[uid] = ghost
+
+        local firstFrame = pd.frames[1]
+        if firstFrame then
+            applyFrame(ghost, firstFrame, 0, uid)
+        end
+    end
+
+    -- Try to upgrade players who were not currently in the server with their
+    -- actual avatar. This runs in parallel and never blocks the replay UI.
+    for _, entry in ipairs(entries) do
+        task.spawn(function()
+            local uid, pd = entry.uid, entry.pd
+
+            -- Already have a real clone.
+            if liveClones[uid] then
+                loadedCount = loadedCount + 1
+                loadLabel.Text = "Players ready  " .. loadedCount .. "/" .. totalCount
+                if loadedCount >= totalCount then
+                    loadIndicator.Visible = false
+                end
+                return
+            end
+
+            local rigType = recordedRigTypes[uid] or Enum.HumanoidRigType.R15
+            local realModel = loadGhostWithTimeout(uid, rigType, LOAD_TIMEOUT, currentReplay.appearances and currentReplay.appearances[uid])
+
+            if realModel and isPlaying and replayCharacters[uid] then
+                realModel.Name = pd.name
+                realModel.Parent = workspace
+                setupGhost(realModel, uid, rigType, pd.frames[1])
+
+                local oldGhost = replayCharacters[uid]
+                replayCharacters[uid] = realModel
+
+                if oldGhost and oldGhost.Parent then
+                    oldGhost:Destroy()
+                end
+
+                local f = frameInterpolated(pd.frames, replayTime)
+                if f then
+                    applyFrame(realModel, f, 0, uid)
+                end
+            end
+
+            loadedCount = loadedCount + 1
+            loadLabel.Text = "Players ready  " .. loadedCount .. "/" .. totalCount
+
+            if loadedCount >= totalCount then
+                task.wait(0.1)
+                loadIndicator.Visible = false
+            end
+        end)
+    end
+
+end
+
+local function endPlayback()
+    if not isPlaying then return end
+    isPlaying = false
+    isPaused = false
+    replayCursorUnlocked = false
+    -- Replay always hands the cursor back to the player when it ends.
+    -- The normal game can re-lock it again when its own camera controller runs.
+    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+    UserInputService.MouseIconEnabled = true
+    replaySavedMouseBehavior = nil
+    replaySavedMouseIcon = nil
+    pauseOverlay.Visible = false
+    tbar.Visible = false
+    loadIndicator.Visible = false
+
+    destroyReplayUIOverlay()
+    setLiveScreenGuisEnabled(true)
+    showAllReal()
+    showSelfChar()
+    stopSpectate()
+
+    stopAllAnims()
+    clearGhosts()
+    clearReplayMap()
+    restoreGameplayWorld()
+    Camera.CameraType = Enum.CameraType.Custom
+    if player.Character then
+        local hum = player.Character:FindFirstChildOfClass("Humanoid")
+        if hum then Camera.CameraSubject = hum end
+    end
+    setSelection(nil)
+
+    playBtn.Text = "▶  Play"
+    playBtn.BackgroundColor3 = Color3.fromRGB(55,170,95)
+    timelineFill.Size = UDim2.new(1,0,1,0)
+    if currentReplay then
+        timeLbl.Text = fmtTime(currentReplay.duration) .. " / " .. fmtTime(currentReplay.duration)
+    end
+    setStatus("Finished", COL.accent)
+end
+
+playBtn.MouseButton1Click:Connect(function()
+    if isPlaying then endPlayback() else beginPlayback() end
+end)
+
+local function seek(delta)
+    if not currentReplay then return end
+    replayTime = math.clamp(replayTime + delta, 0, currentReplay.duration)
+    applyRecordedUIAt(replayTime)
+    applyAppearanceEventsAt(replayTime)
+    updateHUD()
+    for uid, pd in pairs(currentReplay.players) do
+        local ghost = replayCharacters[uid]
+        if ghost and #pd.frames > 0 then
+            local f = frameInterpolated(pd.frames, replayTime)
+            if f then applyFrame(ghost, f, 0, uid) end
+        end
+    end
+end
+
+jumpStartBtn.MouseButton1Click:Connect(function()
+    replayTime = 0
+    applyRecordedUIAt(replayTime)
+    updateHUD()
+    for uid, pd in pairs(currentReplay and currentReplay.players or {}) do
+        local ghost = replayCharacters[uid]
+        local f = ghost and frameAt(pd.frames, replayTime)
+        if f then applyFrame(ghost, f, 0, uid) end
+    end
+end)
+jumpEndBtn.MouseButton1Click:Connect(function()
+    if currentReplay then
+        replayTime = currentReplay.duration
+        updateHUD()
+        for uid, pd in pairs(currentReplay.players) do
+            local ghost = replayCharacters[uid]
+            local f = ghost and frameAt(pd.frames, replayTime)
+            if f then applyFrame(ghost, f, 0, uid) end
+        end
+    end
+end)
+stepBackBtn.MouseButton1Click:Connect(function() seek(-1/30) end)
+stepFwdBtn.MouseButton1Click:Connect(function() seek(1/30) end)
+
+tbarPlay.MouseButton1Click:Connect(function()
+    if isPlaying then setPaused(not isPaused) end
+end)
+tbarRew.MouseButton1Click:Connect(function() seek(-10) end)
+tbarFwd.MouseButton1Click:Connect(function() seek(10) end)
+
+local tbDragging = false
+local function seekFromMouse()
+    if not currentReplay or currentReplay.duration <= 0 then return end
+    local m = UserInputService:GetMouseLocation()
+    local pos, size = tbarSlider.AbsolutePosition, tbarSlider.AbsoluteSize
+    local rel = math.clamp((m.X - pos.X) / size.X, 0, 1)
+    replayTime = rel * currentReplay.duration
+    applyRecordedUIAt(replayTime)
+    updateHUD()
+    for uid, pd in pairs(currentReplay.players) do
+        local ghost = replayCharacters[uid]
+        if ghost and #pd.frames > 0 then
+            local f = frameInterpolated(pd.frames, replayTime)
+            if f then applyFrame(ghost, f, 0, uid) end
+        end
+    end
+end
+tbarSlider.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        tbDragging = true
+        seekFromMouse()
+    end
+end)
+tbarSlider.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        tbDragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if not tbDragging then return end
+    if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+        seekFromMouse()
+    end
+end)
+
+-- Recorded camera runs at the camera render priority instead of Heartbeat.
+-- This keeps first-person/shift-lock recordings visually smooth and prevents
+-- the camera from updating a frame late behind the replay timeline.
+RunService:BindToRenderStep("ReplayRecordedCamera", Enum.RenderPriority.Camera.Value + 1, function()
+    if not isPlaying or Freecam.enabled or not currentReplay then return end
+    if _G.ReplayUseRecordedCamera and currentReplay.localCamera and #currentReplay.localCamera > 0 then
+        local camCF = cameraFrameAt(currentReplay.localCamera, replayTime)
+        if camCF then
+            Camera.CameraType = Enum.CameraType.Scriptable
+            Camera.CFrame = camCF
+            Camera.Focus = camCF
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function(dt)
+    if not isPlaying or not currentReplay then return end
+
+    if not isPaused then
+        replayTime = replayTime + dt * replaySpeed
+        if replayTime >= currentReplay.duration then
+            replayTime = currentReplay.duration
+            updateHUD()
+            task.wait(0.05)
+            endPlayback(); return
+        end
+    end
+
+    updateHUD()
+    applyRecordedUIAt(replayTime)
+    applyAppearanceEventsAt(replayTime)
+
+    local animSpeed = isPaused and 0 or replaySpeed
+    for uid, pd in pairs(currentReplay.players) do
+        local ghost = replayCharacters[uid]
+        if ghost and #pd.frames > 0 then
+            local f = frameInterpolated(pd.frames, replayTime)
+            if f and not isPaused then
+                applyFrame(ghost, f, animSpeed, uid)
+            end
+        end
+    end
+end)
+
+applyAppearanceEventsAt = function(t)
+    if not currentReplay or not currentReplay.appearanceEvents then return end
+    for uid, events in pairs(currentReplay.appearanceEvents) do
+        local index = 0
+        local chosen = nil
+        for i, ev in ipairs(events) do
+            if (ev.time or 0) <= t then index = i; chosen = ev else break end
+        end
+        if index > 0 and appliedAppearanceEventIndex[uid] ~= index and not appearanceReloading[uid] then
+            appliedAppearanceEventIndex[uid] = index
+            local ev = chosen
+            appearanceReloading[uid] = true
+            task.spawn(function()
+                local rigType = Enum.HumanoidRigType[ev.rigType or "R15"] or Enum.HumanoidRigType.R15
+                local model = loadGhostWithTimeout(uid, rigType, LOAD_TIMEOUT, ev.appearance)
+                if model and isPlaying and replayCharacters[uid] then
+                    local pd = currentReplay.players[uid]
+                    model.Name = pd and pd.name or ("Replay_" .. tostring(uid))
+                    model.Parent = workspace
+                    local f = pd and frameInterpolated(pd.frames, replayTime)
+                    setupGhost(model, uid, rigType, f)
+                    local old = replayCharacters[uid]
+                    replayCharacters[uid] = model
+                    if old and old.Parent then old:Destroy() end
+                    if f then applyFrame(model, f, 0, uid) end
+                end
+                appearanceReloading[uid] = nil
+            end)
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════
+-- SPEED SLIDER
+-- ══════════════════════════════════════════════════════════
+local sliderDragging = false
+speedSlider.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = true
+    end
+end)
+speedSlider.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if not sliderDragging then return end
+    if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
+    local m = UserInputService:GetMouseLocation()
+    local pos, size = speedSlider.AbsolutePosition, speedSlider.AbsoluteSize
+    local rel = math.clamp((m.X - pos.X) / size.X, 0, 1)
+    replaySpeed = 0.1 + rel * 4.9
+    speedFill.Size = UDim2.new(rel,0,1,0)
+    speedLbl.Text = string.format("%.1fx", replaySpeed)
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- SERIALIZE (fully sanitized — no more X-axis errors)
+-- ══════════════════════════════════════════════════════════
+local function serialize(replay)
+    local snap = {
+        version = FILE_VERSION,
+        duration = sanitizeNumber(replay.duration),
+        timestamp = sanitizeNumber(replay.timestamp),
+        placeId = replay.placeId,
+        gameName = tostring(replay.gameName or ""),
+        jobId = tostring(replay.jobId or ""),
+        players = {},
+        appearances = {},
+        localCamera = {},
+        mapSnapshot = replay.mapSnapshot or nil,
+        uiSnapshots = replay.uiSnapshots or {},
+    }
+
+    for uid, pd in pairs(replay.players) do
+        local frames = {}
+        for _, f in ipairs(pd.frames or {}) do
+            if f and f.position and f.rotation then
+                local anims = {}
+                for _, a in ipairs(f.animations or {}) do
+                    if a and a.id then
+                        table.insert(anims, {
+                            id = tostring(a.id),
+                            time = sanitizeNumber(a.time),
+                            speed = sanitizeNumber(a.speed or 1),
+                            weight = sanitizeNumber(a.weight or 0),
+                            priority = tostring(a.priority or "Core"),
+                        })
+                    end
+                end
+                table.insert(frames, {
+                    time = sanitizeNumber(f.time),
+                    position = safePosition(f.position),
+                    rotation = safeCFrameComponents(f.rotation),
+                    health = sanitizeNumber(f.health or 100),
+                    maxHealth = sanitizeNumber(f.maxHealth or 100),
+                    hipHeight = sanitizeNumber(f.hipHeight or 0),
+                    dead = f.dead and true or false,
+                    animations = anims,
+                    accessories = f.accessories or {},
+                })
+            end
+        end
+        local rigName = "R15"
+        if recordedRigTypes[uid] then rigName = recordedRigTypes[uid].Name end
+        snap.players[tostring(uid)] = {
+            name = tostring(pd.name or "Player"),
+            userId = sanitizeNumber(uid),
+            frames = frames,
+            rigType = rigName,
+            appearance = replay.appearances and replay.appearances[uid] or nil,
+        }
+    end
+
+    for uid, appearance in pairs(replay.appearances or {}) do
+        if type(appearance) == "table" then
+            local a = {version = appearance.version or 1, props = {}, colors = {}}
+            for prop, value in pairs(appearance.props or {}) do
+                local typ = type(value)
+                if typ == "string" or typ == "number" or typ == "boolean" then
+                    a.props[prop] = value
+                end
+            end
+            for prop, value in pairs(appearance.colors or {}) do
+                if type(value) == "table" then
+                    a.colors[prop] = {sanitizeNumber(value[1]), sanitizeNumber(value[2]), sanitizeNumber(value[3])}
+                end
+            end
+            snap.appearances[tostring(uid)] = a
+        end
+    end
+
+    -- Also keep the appearance on each player entry for older loaders that do
+    -- not understand the top-level appearances map.
+    for uid, pd in pairs(snap.players) do
+        if not snap.appearances[uid] and pd.appearance then
+            snap.appearances[uid] = pd.appearance
+        end
+    end
+
+    for _, cf in ipairs(replay.localCamera or {}) do
+        if cf and cf.time and cf.cframe and typeof(cf.cframe) == "CFrame" then
+            table.insert(snap.localCamera, {
+                time = sanitizeNumber(cf.time),
+                cf = safeCFrameComponents(cf.cframe)
+            })
+        end
+    end
+
+    snap.appearanceEvents = {}
+    for uid, events in pairs(replay.appearanceEvents or {}) do
+        local safeEvents = {}
+        for _, ev in ipairs(events or {}) do
+            if type(ev) == "table" and type(ev.appearance) == "table" then
+                local a = {version=ev.appearance.version or 1, props={}, colors={}}
+                for prop, value in pairs(ev.appearance.props or {}) do
+                    local typ = type(value)
+                    if typ == "string" or typ == "number" or typ == "boolean" then a.props[prop] = value end
+                end
+                for prop, value in pairs(ev.appearance.colors or {}) do
+                    if type(value) == "table" then a.colors[prop] = {sanitizeNumber(value[1]),sanitizeNumber(value[2]),sanitizeNumber(value[3])} end
+                end
+                table.insert(safeEvents,{time=sanitizeNumber(ev.time or 0),appearance=a,rigType=tostring(ev.rigType or "R15")})
+            end
+        end
+        snap.appearanceEvents[tostring(uid)] = safeEvents
+    end
+
+    return snap
+end
+
+local function deserialize(snap)
+    local rt = {
+        duration = snap.duration or 0,
+        timestamp = snap.timestamp,
+        placeId = snap.placeId,
+        gameName = snap.gameName, jobId = snap.jobId,
+        players = {}, appearances = {}, localCamera = {},
+        mapSnapshot = snap.mapSnapshot,
+        uiSnapshots = snap.uiSnapshots or {},
+        appearanceEvents = {},
+    }
+
+    for uidStr, pd in pairs(snap.players or {}) do
+        local uid = tonumber(uidStr) or pd.userId
+        if uid then
+            local frames = {}
+            for _, f in ipairs(pd.frames or {}) do
+                if f and f.position and f.rotation then
+                    local pos = Vector3.new(
+                        tonumber(f.position.x) or 0,
+                        tonumber(f.position.y) or 0,
+                        tonumber(f.position.z) or 0)
+
+                    local rot = cframeFromSerialized(f.rotation)
+
+                    table.insert(frames, {
+                        time = f.time or 0,
+                        position = pos,
+                        rotation = rot,
+                        health = f.health or 100,
+                        maxHealth = f.maxHealth or 100,
+                        hipHeight = f.hipHeight or 0,
+                        dead = f.dead or false,
+                        animations = f.animations or {},
+                        accessories = f.accessories or {},
+                    })
+                end
+            end
+            rt.players[uid] = {name = pd.name or "Player", userId = uid, frames = frames}
+            if pd.appearance then
+                rt.appearances[uid] = pd.appearance
+            end
+            if pd.rigType then
+                recordedRigTypes[uid] = Enum.HumanoidRigType[pd.rigType] or Enum.HumanoidRigType.R15
+            end
+        end
+    end
+
+    for uidStr, appearance in pairs(snap.appearances or {}) do
+        local uid = tonumber(uidStr)
+        if uid and type(appearance) == "table" then
+            rt.appearances[uid] = appearance
+        end
+    end
+
+    for uid, pd in pairs(rt.players) do
+        if not rt.appearances[uid] and snap.players and snap.players[tostring(uid)] then
+            rt.appearances[uid] = snap.players[tostring(uid)].appearance
+        end
+    end
+
+    for uidStr, events in pairs(snap.appearanceEvents or {}) do
+        local uid = tonumber(uidStr)
+        if uid then
+            rt.appearanceEvents[uid] = {}
+            for _, ev in ipairs(events or {}) do
+                if type(ev) == "table" and type(ev.appearance) == "table" then
+                    table.insert(rt.appearanceEvents[uid],{time=tonumber(ev.time) or 0,appearance=ev.appearance,rigType=ev.rigType or "R15"})
+                end
+            end
+            table.sort(rt.appearanceEvents[uid],function(a,b) return (a.time or 0) < (b.time or 0) end)
+        end
+    end
+
+    for _, ecf in ipairs(snap.localCamera or {}) do
+        local c = ecf.cf
+        if c and c.x ~= nil and (c.r00 ~= nil or (c.xa and c.ya and c.za)) then
+            local camCF = cframeFromSerialized(c)
+            table.insert(rt.localCamera, {time = ecf.time or 0, cframe = camCF})
+        end
+    end
+    return rt
+end
+
+local function quickMeta(content)
+    local placeId = tonumber(content:match('"placeId"%s*:%s*(%-?%d+)')) or 0
+    local gameName = content:match('"gameName"%s*:%s*"([^"]*)"') or ""
+    local duration = tonumber(content:match('"duration"%s*:%s*([%d%.]+)')) or 0
+    local hasCam = content:match('"localCamera"%s*:%s*%[%s*{') ~= nil
+    local hasMap = content:match('"mapSnapshot"%s*:%s*{') ~= nil
+    return placeId, gameName, duration, hasCam, hasMap
+end
+
+-- ══════════════════════════════════════════════════════════
+-- FILES
+-- ══════════════════════════════════════════════════════════
+local function loadReplayPath(path)
+    local name = path:match("[^/\\]+$") or path
+    setStatus("Loading " .. name, COL.accent)
+    local ok, content = pcall(readfile, path)
+    if not ok then setStatus("Read failed", COL.bad); return end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not ok2 then setStatus("Decode failed", COL.bad); return end
+    local ok3, rt = pcall(deserialize, data)
+    if not ok3 then setStatus("Parse failed: " .. tostring(rt):sub(1,40), COL.bad); return end
+    currentReplay = rt
+    local warn = ""
+    if data.placeId and data.placeId ~= game.PlaceId then
+        warn = " ⚠ " .. (data.gameName or ("Place "..data.placeId))
+    end
+    setStatus("Loaded: " .. name .. warn, COL.good)
+end
+
+local function refreshFileList()
+    for _, c in ipairs(fileScroll:GetChildren()) do
+        if c:IsA("TextButton") or c:IsA("Frame") then c:Destroy() end
+    end
+    selectedFile = nil
+    if not canList() or not canRead() then
+        new("TextLabel", {Size = UDim2.new(1,0,0,30), BackgroundTransparency = 1,
+            Text = "No file access (executor only)", TextColor3 = COL.warn,
+            Font = Enum.Font.Gotham, TextSize = 11, Parent = fileScroll})
+        return
+    end
+    ensureFolder()
+    local ok, files = pcall(listfiles, REPLAY_FOLDER)
+    if not ok or not files or #files == 0 then
+        new("TextLabel", {Size = UDim2.new(1,0,0,30), BackgroundTransparency = 1,
+            Text = "No replays yet", TextColor3 = COL.sub,
+            Font = Enum.Font.Gotham, TextSize = 11, Parent = fileScroll})
+        return
+    end
+    table.sort(files)
+    local order = 0
+    for _, path in ipairs(files) do
+        local name = path:match("[^/\\]+$") or path
+        if name:match("%.json$") then
+            order = order + 1
+            local content = ""
+            pcall(function() content = readfile(path) end)
+            local placeId, gameName, duration, hasCam, hasMap = quickMeta(content)
+            local subText
+            if gameName ~= "" then
+                subText = gameName
+                if placeId ~= game.PlaceId then subText = subText .. "  •  OTHER GAME" end
+            else
+                subText = "Place " .. placeId
+            end
+            subText = string.format("%s  •  %s%s%s", subText, fmtTime(duration), hasCam and "  •  📷" or "", hasMap and "  •  🗺 MAP" or "")
+
+            local wrapper = new("Frame", {
+                Size = UDim2.new(1,-6,0,44), BackgroundColor3 = COL.panel2,
+                BorderSizePixel = 0, LayoutOrder = order, Parent = fileScroll
+            })
+            corner(6, wrapper)
+            local btn = new("TextButton", {
+                Size = UDim2.new(1,0,1,0), BackgroundColor3 = COL.panel2,
+                BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = wrapper
+            })
+            corner(6, btn)
+            new("TextLabel", {
+                Size = UDim2.new(1,-10,0,20), Position = UDim2.new(0,8,0,3),
+                BackgroundTransparency = 1, Text = "📄  " .. name,
+                TextColor3 = COL.text, Font = Enum.Font.GothamBold, TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Left, Parent = wrapper
+            })
+            new("TextLabel", {
+                Size = UDim2.new(1,-10,0,16), Position = UDim2.new(0,8,0,23),
+                BackgroundTransparency = 1, Text = subText,
+                TextColor3 = COL.sub, Font = Enum.Font.Gotham, TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Left, Parent = wrapper
+            })
+            btn.MouseButton1Click:Connect(function()
+                selectedFile = path
+                for _, c in ipairs(fileScroll:GetChildren()) do
+                    if c:IsA("Frame") then
+                        c.BackgroundColor3 = (c == wrapper) and COL.accent or COL.panel2
+                    end
+                end
+            end)
+            btn.MouseButton2Click:Connect(function() loadReplayPath(path) end)
+        end
+    end
+end
+
+saveBtn.MouseButton1Click:Connect(function()
+    if not currentReplay then setStatus("Nothing to save", COL.warn); return end
+    if not fsHas() then setStatus("No writefile (executor only)", COL.bad); return end
+
+    local name = nameBox.Text
+    if name == "" then name = "replay_" .. os.date("%Y-%m-%d_%H-%M-%S") end
+    name = name:gsub("[^%w_%-%.]", "_")
+
+    -- Step 1: serialize (safe)
+    local ok1, snap = pcall(serialize, currentReplay)
+    if not ok1 then
+        setStatus("Serialize: " .. tostring(snap):sub(1,35), COL.bad)
+        warn("[ReplayMod] Serialize error:", snap); return
+    end
+
+    -- Step 2: encode (safe)
+    local ok2, json = pcall(function() return HttpService:JSONEncode(snap) end)
+    if not ok2 then
+        setStatus("Encode: " .. tostring(json):sub(1,35), COL.bad)
+        warn("[ReplayMod] Encode error:", json); return
+    end
+
+    -- Step 3: write (safe)
+    ensureFolder()
+    local paths = { REPLAY_FOLDER .. "/" .. name .. ".json", name .. ".json" }
+    local savedPath, lastErr
+    for _, p in ipairs(paths) do
+        local ok3, err = pcall(writefile, p, json)
+        if ok3 then savedPath = p; break else lastErr = err end
+    end
+    if savedPath then
+        setStatus("Saved → " .. savedPath, COL.good)
+        refreshFileList()
+    else
+        setStatus("Write: " .. tostring(lastErr):sub(1,35), COL.bad)
+        warn("[ReplayMod] Write error:", lastErr)
+    end
+end)
+
+refreshBtn.MouseButton1Click:Connect(refreshFileList)
+deleteBtn.MouseButton1Click:Connect(function()
+    if not selectedFile then setStatus("Select a file first", COL.warn); return end
+    if not canDelete() then setStatus("No delfile (executor only)", COL.bad); return end
+    local ok = pcall(delfile, selectedFile)
+    if ok then
+        setStatus("Deleted", COL.good)
+        selectedFile = nil
+        refreshFileList()
+    else
+        setStatus("Delete failed", COL.bad)
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- REPLAY CURSOR / ALT UNLOCK
+--
+-- While replay/freecam is active the mouse stays locked and invisible.
+-- Holding either Alt key temporarily releases it. Releasing Alt locks it
+-- again. When replay/freecam finishes, the cursor is visible again.
+-- ══════════════════════════════════════════════════════════
+local function altIsDown()
+    return UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt)
+        or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
+end
+
+local function setReplayCursorUnlocked(unlocked)
+    replayCursorUnlocked = unlocked
+
+    if isPlaying or Freecam.enabled then
+        if unlocked then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        else
+            UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+            UserInputService.MouseIconEnabled = false
+        end
+    else
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+    end
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if input.KeyCode ~= Enum.KeyCode.LeftAlt and input.KeyCode ~= Enum.KeyCode.RightAlt then return end
+    if isPlaying or Freecam.enabled then
+        setReplayCursorUnlocked(true)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode ~= Enum.KeyCode.LeftAlt and input.KeyCode ~= Enum.KeyCode.RightAlt then return end
+    if isPlaying or Freecam.enabled then
+        task.defer(function()
+            setReplayCursorUnlocked(altIsDown())
+        end)
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- KEYBOARD
+-- ══════════════════════════════════════════════════════════
+local function hideUI()
+    uiHidden = true
+    main.Visible = false
+    tbar.Visible = false
+    pauseOverlay.Visible = false
+end
+local function showUI()
+    uiHidden = false
+    main.Visible = true
+    if isPlaying then tbar.Visible = true end
+    if isPaused then pauseOverlay.Visible = true end
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if UserInputService:GetFocusedTextBox() then return end
+
+    if input.KeyCode == Enum.KeyCode.P
+        and (UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)) then
+        Freecam.Toggle()
+        return
+    end
+
+    if input.KeyCode == Enum.KeyCode.Space and isPlaying and not processed then
+        setPaused(not isPaused)
+        return
+    end
+
+    if processed then return end
+
+    if input.KeyCode == Enum.KeyCode.R and not UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+        if isRecording then stopRec() else startRec() end
+    elseif input.KeyCode == Enum.KeyCode.P and not UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+        playBtn:Activate()
+    elseif input.KeyCode == Enum.KeyCode.F then
+        if selectedHumanoid and selectedHumanoid.Parent then
+            spectateTarget(selectedHumanoid)
+        elseif spectating then
+            stopSpectate()
+        end
+    elseif input.KeyCode == Enum.KeyCode.H then
+        if uiHidden then showUI() else hideUI() end
+    elseif input.KeyCode == Enum.KeyCode.O and isPlaying then
+        replayUIEnabled = not replayUIEnabled
+        if replayUIEnabled then
+            setLiveScreenGuisEnabled(false)
+            applyRecordedUIAt(replayTime)
+            setStatus("Recorded game UI shown", COL.good)
+        else
+            destroyReplayUIOverlay()
+            setLiveScreenGuisEnabled(true)
+            setStatus("Recorded game UI hidden", COL.accent)
+        end
+    elseif input.KeyCode == Enum.KeyCode.LeftBracket then
+        replaySpeed = math.max(replaySpeed - 0.1, 0.1)
+        speedLbl.Text = string.format("%.1fx", replaySpeed)
+    elseif input.KeyCode == Enum.KeyCode.RightBracket then
+        replaySpeed = math.min(replaySpeed + 0.1, 5)
+        speedLbl.Text = string.format("%.1fx", replaySpeed)
+    elseif isPlaying then
+        if input.KeyCode == Enum.KeyCode.Left then seek(-5)
+        elseif input.KeyCode == Enum.KeyCode.Right then seek(5)
+        elseif input.KeyCode == Enum.KeyCode.Comma then setPaused(true); seek(-1/30)
+        elseif input.KeyCode == Enum.KeyCode.Period then setPaused(true); seek(1/30)
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════
+-- WINDOW CONTROLS
+-- ══════════════════════════════════════════════════════════
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    main.Size = minimized and UDim2.new(0,360,0,38) or UDim2.new(0,360,0,480)
+    minBtn.Text = minimized and "+" or "−"
+    tabRow.Visible = not minimized
+    statusBar.Visible = not minimized
+    for n, c in pairs(tabContents) do
+        c.Visible = (not minimized) and (n == activeTab)
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    -- Release the cursor first so a cleanup error can never trap it.
+    pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+    pcall(function() UserInputService.MouseIconEnabled = true end)
+    if Freecam.enabled then pcall(function() Freecam.Stop() end) end
+    if isPlaying then pcall(function() endPlayback() end) end
+    realHidden = false
+    pcall(showAllReal)
+    pcall(showSelfChar)
+    pcall(function() gui.Enabled = false end)
+end)
+
+for n, c in pairs(tabContents) do c.Visible = (n == "Record") end
+for n, b in pairs(tabs) do
+    b.BackgroundColor3 = (n == "Record") and COL.accent or COL.panel
+    b.TextColor3 = (n == "Record") and Color3.new(1,1,1) or COL.sub
+end
+activeTab = "Record"
+
+-- ══════════════════════════════════════════════════════════
+-- INIT
+-- ══════════════════════════════════════════════════════════
+game:BindToClose(function()
+    showAllReal(); showSelfChar(); stopAllAnims(); clearGhosts(); clearReplayMap(); restoreGameplayWorld()
+    if Freecam.enabled then Freecam.Stop() end
+end)
+
+ensureFolder()
+refreshFileList()
+setStatus("Ready — R record • P studio • Space pause • Alt cursor • Shift+P freecam • v16.1 stable", COL.good)
+print("[REPLAY MOD v16.1] Loaded. Save folder: " .. REPLAY_FOLDER)
