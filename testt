@@ -3238,7 +3238,6 @@ closeBtn.MouseButton1Click:Connect(function()
     pcall(showSelfChar)
     pcall(function() gui.Enabled = false end)
 end)
-
 for n, c in pairs(tabContents) do c.Visible = (n == "Record") end
 for n, b in pairs(tabs) do
     b.BackgroundColor3 = (n == "Record") and COL.accent or COL.panel
