@@ -3257,4 +3257,4 @@ end)
 ensureFolder()
 refreshFileList()
 setStatus("Ready — R record • P studio • Space pause • Alt cursor • Shift+P freecam • v15.2 stable", COL.good)
-print("[REPLAY MOD v15.2 Stable] Loaded. Save folder: " .. REPLAY_FOLDER)  an issue with this is it gets the players who newly respawn and if like parts move on my screen it doesnt catch that or if players become meshes or change example any prop hunt things or anything give entire code 
+print("[REPLAY MOD v15.2 Stable] Loaded. Save folder: " .. REPLAY_FOLDER)
