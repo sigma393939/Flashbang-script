@@ -1,79 +1,14 @@
 
 --[[
- ___       _______   ________  ________  ________      ___    ___
-|\  \     |\  ___ \ |\   ____\|\   __  \|\   ____\    |\  \  /  /|
-\ \  \    \ \   __/|\ \  \___|\ \  \|\  \ \  \___|    \ \  \/  / /
- \ \  \    \ \  \_|/_\ \  \  __\ \   __  \ \  \        \ \    / /
-  \ \  \____\ \  \_|\ \ \  \|\  \ \  \ \  \ \  \____    \/   / /
-   \ \_______\ \_______\ \_______\ \_______\ \_______\__/   / /
-    \|_______|\|_______|\|_______|\|__|\|__|\|_______|\____/ /
+    LEGACY 2016 BRANCH
+    UI loader, old graphics, old console, old chat,
+    display-name behavior, cursor trail, gamepad pointer,
+    motion blur, and smoother scrolling.
 
-    LEGACY + SMOOTH CURSOR MOTION TRAIL
-    PC: Native arrow + fast arrow trail
-    Gamepad: Smooth pointer indicator
-    Includes eased scrolling and short-lived scene blur
+    Run after the Suite script has been loaded.
 ]]
 
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-
---==================================================
--- SETTINGS
---==================================================
-
-local Environment = getgenv or function()
-    return _G
-end
-
-local Env = Environment()
-
-local Settings = Env.LegacySettings or {
-    Year = 2012,
-    OldGraphics = true,
-    HideDisplayName = true,
-    SafeChat = true,
-    OldConsole = true,
-    OldBubbleChat = true,
-}
-
-local Effects = {
-    -- Cursor trail
-    TrailEnabled = true,
-    TrailCount = 8,
-    TrailOpacity = 0.72,
-    TrailScale = 1,
-
-    -- Higher = less cursor lag
-    TrailFollowSpeed = 65,
-    TrailSpeedResponse = 24,
-    TrailMaxSpeed = 3000,
-
-    -- Motion blur
-    MotionBlurEnabled = true,
-    MotionBlurMax = 3,
-    MotionBlurThreshold = 650,
-    MotionBlurStrength = 0.002,
-    MotionBlurFadeSpeed = 24,
-
-    -- Gamepad indicator
-    GamepadDotEnabled = true,
-    DotSize = 7,
-
-    -- Scrolling
-    SmoothScrolling = true,
-    ScrollSmoothness = 24,
-    ScrollSpeed = 48,
-
-    -- Brief scene blur during scrolling
-    ScrollBlurEnabled = true,
-    ScrollBlurMax = 1.5,
-    ScrollBlurFadeSpeed = 18,
-}
-
---==================================================
--- SERVICES
---==================================================
+repeat task.wait() until game:IsLoaded()
 
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
@@ -86,123 +21,161 @@ local RunService = game:GetService("RunService")
 local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
 
+local Env = (getgenv and getgenv()) or _G
+
 --==================================================
--- CLEANUP PREVIOUS INSTANCE
+-- SETTINGS
 --==================================================
 
-for _, Name in ipairs({
-    "LegacyCursorEffects",
-    "LegacyScrollBlur",
-}) do
-    local Existing = PlayerGui:FindFirstChild(Name)
-        or Lighting:FindFirstChild(Name)
+local Settings = Env.LegacySettings or {
+    Year = 2016,
+    OldGraphics = true,
+    HideDisplayName = true,
+    SafeChat = false,
+    OldConsole = true,
+    OldBubbleChat = true,
+}
 
-    if Existing then
-        Existing:Destroy()
+--==================================================
+-- EFFECT SETTINGS
+--==================================================
+
+local Effects = {
+    TrailEnabled = true,
+    TrailCount = 12,
+    TrailOpacity = 0.78,
+    TrailScale = 1.5,
+    TrailFollowSpeed = 65,
+    TrailSpeedResponse = 24,
+    TrailMaxSpeed = 3000,
+    TrailFadePower = 1.5,
+
+    MotionBlurEnabled = true,
+    MotionBlurMax = 2,
+    MotionBlurThreshold = 650,
+    MotionBlurStrength = 0.0015,
+    MotionBlurFadeSpeed = 12,
+
+    GamepadDotEnabled = true,
+    DotSize = 7,
+
+    SmoothScrolling = true,
+    ScrollSmoothness = 18,
+    ScrollSpeed = 48,
+    ScrollBlurEnabled = true,
+    ScrollBlurMax = 0.5,
+    ScrollBlurFadeSpeed = 12,
+}
+
+--==================================================
+-- GENERAL HELPERS
+--==================================================
+
+local function Force(callback)
+    local ok, result = pcall(callback)
+    if not ok then
+        warn("[Legacy] " .. tostring(result))
+    end
+    return ok, result
+end
+
+local function Set(object, property, value)
+    if object then
+        Force(function()
+            object[property] = value
+        end)
     end
 end
 
+local function Create(className, properties, parent)
+    local object = Instance.new(className)
+
+    for property, value in pairs(properties or {}) do
+        Set(object, property, value)
+    end
+
+    object.Parent = parent
+    return object
+end
+
+local function SmoothAlpha(speed, deltaTime)
+    return 1 - math.exp(-speed * deltaTime)
+end
+
+local function GetEnvironment()
+    return (getgenv and getgenv()) or _G
+end
+
+local function GetSuite()
+    local environment = GetEnvironment()
+
+    if environment.Suite then
+        return environment.Suite
+    end
+
+    return nil
+end
+
 --==================================================
--- HELPERS
+-- CLEAN OLD INSTANCES
 --==================================================
 
-local function Force(Object, Property, Value)
-    if not Object then
+local function RemoveNamed(parent, name)
+    if not parent then
         return
     end
 
-    pcall(function()
-        Object[Property] = Value
-
-        Object:GetPropertyChangedSignal(Property):Connect(function()
-            if Object.Parent and Object[Property] ~= Value then
-                Object[Property] = Value
-            end
-        end)
-    end)
-end
-
-local function Set(Object, Properties, Forced)
-    if not Object then
-        return
-    end
-
-    for Property, Value in pairs(Properties) do
-        pcall(function()
-            Object[Property] = Value
-
-            if Forced then
-                Force(Object, Property, Value)
-            end
-        end)
+    for _, child in ipairs(parent:GetChildren()) do
+        if child.Name == name then
+            Force(function()
+                child:Destroy()
+            end)
+        end
     end
 end
 
-local function Create(ClassName, Properties, Forced, Parent)
-    local Object = Instance.new(ClassName)
-
-    Set(Object, Properties, Forced)
-
-    if Parent then
-        Object.Parent = Parent
-    end
-
-    return Object
-end
-
-local function Run(Enabled, Callback)
-    if Enabled then
-        task.spawn(Callback)
-    end
-end
-
-local function SmoothAlpha(Speed, DeltaTime)
-    return 1 - math.exp(-Speed * math.min(DeltaTime, 0.05))
-end
+RemoveNamed(PlayerGui, "LegacyCursorEffects")
+RemoveNamed(Lighting, "LegacyCursorMotionBlur")
+RemoveNamed(Lighting, "LegacyScrollBlur")
 
 --==================================================
--- LEGACY LOADER
+-- LOAD LEGACY MODEL
 --==================================================
 
 local Developer = false
 
-pcall(function()
-    Developer = isfile
-        and isfile("yeku.txt")
-        and isfile("Legacy.rbxm")
-end)
+if type(isfile) == "function" then
+    Force(function()
+        Developer = isfile("yeku.txt")
+            and isfile("Legacy.rbxm")
+    end)
+end
 
-local RobloxGui = CoreGui:WaitForChild("RobloxGui")
+local RobloxGui
+Force(function()
+    RobloxGui = CoreGui:WaitForChild("RobloxGui", 10)
+end)
 
 local ChatBubbles
-
-pcall(function()
-    ChatBubbles = CoreGui
-        :WaitForChild("ExperienceChat")
-        :WaitForChild("bubbleChat")
+Force(function()
+    local experienceChat = CoreGui:FindFirstChild("ExperienceChat")
+    if experienceChat then
+        ChatBubbles = experienceChat:FindFirstChild("bubbleChat")
+    end
 end)
 
-local Suite = Env.Suite
+local Suite = GetSuite()
 
 if not Suite then
-    Suite = loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/sigma393939/Flashbang-script/refs/heads/main/rbxmsuit"
-    ))()
-
-    Env.Suite = Suite
+    error(
+        "[Legacy] Suite is missing. Run the Suite script first, "
+        .. "or update this Branch to use your existing Suite URL."
+    )
 end
 
 local Path
 
 if Developer then
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title = "Legacy",
-            Text = "Running the developer build",
-            Duration = 5,
-        })
-    end)
-
     Path = "Legacy.rbxm"
 else
     Path = Suite.download(
@@ -214,653 +187,599 @@ end
 local Legacy = Suite.launch(Path, {
     runscripts = true,
     debug = true,
+    name = "Legacy2016",
 })
-
-assert(Legacy, "Legacy failed to load.")
 
 local LegacyModule = Suite.require(Legacy)
 
-assert(
-    LegacyModule and LegacyModule.Start,
-    "Legacy module does not expose Start()."
-)
+assert(type(LegacyModule) == "table",
+    "Legacy model did not return a module table")
 
-local LegacyGui = LegacyModule:Start(
-    Settings.Year,
-    Settings.SafeChat
-)
+assert(type(LegacyModule.Start) == "function",
+    "Legacy module has no Start function")
 
-RobloxGui.Enabled = false
+LegacyModule:Start(Settings.Year, Settings.SafeChat)
 
-pcall(function()
-    RobloxGui.NotificationFrame.Parent = LegacyGui
-end)
+-- Hide the modern RobloxGui after the Legacy interface is started.
+if RobloxGui then
+    Set(RobloxGui, "Enabled", false)
+
+    local notificationFrame =
+        RobloxGui:FindFirstChild("NotificationFrame", true)
+
+    if notificationFrame then
+        Force(function()
+            notificationFrame.Parent = PlayerGui
+        end)
+    end
+end
 
 --==================================================
 -- OLD CONSOLE
 --==================================================
 
-Run(Settings.OldConsole == true, function()
-    local Success, Error = pcall(function()
-        loadstring(game:HttpGet(
-            "https://raw.githubusercontent.com/sigma393939/Flashbang-script/refs/heads/main/legacyconsole"
-        ))()
-    end)
+if Settings.OldConsole then
+    Force(function()
+        local consoleUrl =
+            "https://raw.githubusercontent.com/"
+            .. "sigma393939/Flashbang-script/"
+            .. "refs/heads/main/legacyconsole"
 
-    if not Success then
-        warn("[Legacy] Console failed:", Error)
-    end
-end)
+        local source = game:HttpGet(consoleUrl)
+        local chunk = assert(loadstring(source))
+
+        chunk()
+    end)
+end
 
 --==================================================
 -- OLD GRAPHICS
 --==================================================
 
-Run(Settings.OldGraphics == true, function()
-    if sethiddenproperty then
-        pcall(function()
-            sethiddenproperty(
-                Lighting,
-                "Technology",
-                Enum.Technology.Compatibility
-            )
-        end)
-    end
+if Settings.OldGraphics then
+    Force(function()
+        if type(sethiddenproperty) == "function" then
+            pcall(sethiddenproperty, Lighting,
+                "Technology", Enum.Technology.Compatibility)
+        end
+    end)
 
-    for _, Object in ipairs(Lighting:GetDescendants()) do
-        if Object:IsA("Atmosphere") then
-            Object:Destroy()
-
-        elseif Object:IsA("DepthOfFieldEffect")
-            or Object:IsA("SunRaysEffect")
-            or Object:IsA("BloomEffect")
-            or Object:IsA("BlurEffect")
-            or Object:IsA("ColorCorrectionEffect") then
-
-            Object.Enabled = false
+    for _, effect in ipairs(Lighting:GetChildren()) do
+        if effect:IsA("Atmosphere")
+            or effect:IsA("BloomEffect")
+            or effect:IsA("DepthOfFieldEffect")
+            or effect:IsA("SunRaysEffect")
+            or effect:IsA("BlurEffect") then
+            Force(function()
+                effect:Destroy()
+            end)
         end
     end
 
-    pcall(function()
-        Create("ColorGradingEffect", {
-            TonemapperPreset = Enum.TonemapperPreset.Retro,
-        }, false, Lighting)
-    end)
+    Create("ColorCorrectionEffect", {
+        Name = "LegacyRetroColor",
+        Brightness = 0,
+        Contrast = 0.08,
+        Saturation = -0.08,
+        Enabled = true,
+    }, Lighting)
 
     Create("ColorCorrectionEffect", {
-        Saturation = 0,
-        Contrast = -0.1,
-    }, false, Lighting)
-end)
+        Name = "LegacyRetroColorGrading",
+        Brightness = 0,
+        Contrast = 0.03,
+        Saturation = -0.03,
+        TintColor = Color3.fromRGB(255, 250, 240),
+        Enabled = true,
+    }, Lighting)
+end
 
 --==================================================
 -- OLD BUBBLE CHAT
 --==================================================
 
-Run(Settings.OldBubbleChat == true, function()
-    if not ChatBubbles then
-        return
-    end
+if Settings.OldBubbleChat then
+    Force(function()
+        local bubbleConfig =
+            TextChatService:FindFirstChildOfClass(
+                "BubbleChatConfiguration"
+            )
 
-    local Configuration =
-        TextChatService:WaitForChild("BubbleChatConfiguration")
-
-    local SourceSans = Font.fromEnum(Enum.Font.SourceSans)
-
-    local PaddingData = {
-        PaddingBottom = UDim.new(0, 4),
-        PaddingTop = UDim.new(0, 4),
-        PaddingLeft = UDim.new(0, 6),
-        PaddingRight = UDim.new(0, 6),
-    }
-
-    local function ConvertTail(Tail)
-        if Tail then
-            Set(Tail, {
-                Size = UDim2.fromOffset(25, 10),
-                ImageTransparency = 0,
-                Image = "rbxassetid://89395716827984",
-            })
+        if bubbleConfig then
+            bubbleConfig.Enabled = true
+            bubbleConfig.BackgroundColor3 =
+                Color3.fromRGB(245, 245, 245)
+            bubbleConfig.TextColor3 =
+                Color3.fromRGB(25, 25, 25)
+            bubbleConfig.TextSize = 16
+            bubbleConfig.Font = Enum.Font.SourceSans
+            bubbleConfig.TailVisible = true
+            bubbleConfig.BubbleDuration = 8
         end
+    end)
+
+    if ChatBubbles then
+        Force(function()
+            ChatBubbles.Visible = true
+        end)
     end
-
-    local function ConvertBubble(Bubble)
-        local Rounded = Bubble:FindFirstChild("RoundedFrame")
-        local Contents = Rounded and Rounded:FindFirstChild("Contents")
-
-        local Corner = Rounded
-            and Rounded:FindFirstChildOfClass("UICorner")
-
-        local Padding = Contents
-            and Contents:FindFirstChildOfClass("UIPadding")
-
-        local Label = Contents
-            and Contents:FindFirstChildOfClass("TextLabel")
-
-        ConvertTail(Bubble:FindFirstChild("Carat"))
-
-        Set(Bubble, {
-            Size = UDim2.fromOffset(46, 35),
-        }, true)
-
-        Set(Rounded, {
-            Size = UDim2.fromOffset(46, 35),
-        }, true)
-
-        Set(Contents, {
-            Size = UDim2.fromOffset(46, 35),
-        }, true)
-
-        Set(Corner, {
-            CornerRadius = UDim.new(0, 5),
-        })
-
-        Set(Padding, PaddingData)
-
-        Set(Label, {
-            FontFace = SourceSans,
-            TextSize = 22,
-            TextColor3 = Color3.fromRGB(60, 68, 75),
-            TextTransparency = 0,
-        }, true)
-    end
-
-    local function Convert(Object)
-        if Object.Name == "Caret" then
-            ConvertTail(Object)
-        elseif Object.Name == "DistantBubble" then
-            ConvertBubble(Object)
-        end
-    end
-
-    Set(Configuration, {
-        FontFace = SourceSans,
-        TextSize = 22,
-        TextColor3 = Color3.fromRGB(60, 68, 75),
-        BackgroundTransparency = 0,
-        LocalPlayerStudsOffset = Vector3.new(0, 0.4, 0),
-    }, true)
-
-    Create("UICorner", {
-        CornerRadius = UDim.new(0, 5),
-    }, false, Configuration)
-
-    Create("UIPadding", PaddingData, false, Configuration)
-
-    for _, Object in ipairs(ChatBubbles:GetDescendants()) do
-        Convert(Object)
-    end
-
-    ChatBubbles.DescendantAdded:Connect(Convert)
-end)
+end
 
 --==================================================
 -- HIDE DISPLAY NAMES
 --==================================================
 
-Run(Settings.HideDisplayName == true, function()
-    local function Apply(PlayerObject, Character)
-        local Humanoid = Character:WaitForChild("Humanoid", 10)
-
-        if Humanoid and Humanoid:IsA("Humanoid") then
-            pcall(function()
-                Humanoid.DisplayName = PlayerObject.Name
-            end)
-        end
+local function ApplyDisplayName(character)
+    if not Settings.HideDisplayName or not character then
+        return
     end
 
-    local function ConnectPlayer(PlayerObject)
-        if PlayerObject.Character then
-            task.spawn(Apply, PlayerObject, PlayerObject.Character)
-        end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+        or character:WaitForChild("Humanoid", 5)
 
-        PlayerObject.CharacterAdded:Connect(function(Character)
-            task.spawn(Apply, PlayerObject, Character)
-        end)
+    if humanoid then
+        Set(humanoid, "DisplayName", Player.Name)
+    end
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if player.Character then
+        ApplyDisplayName(player.Character)
     end
 
-    for _, PlayerObject in ipairs(Players:GetPlayers()) do
-        ConnectPlayer(PlayerObject)
-    end
+    player.CharacterAdded:Connect(function(character)
+        task.defer(ApplyDisplayName, character)
+    end)
+end
 
-    Players.PlayerAdded:Connect(ConnectPlayer)
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(character)
+        ApplyDisplayName(character)
+    end)
 end)
 
 --==================================================
 -- REMOVE MODERN TOP BAR / CONTROLS
 --==================================================
 
-task.spawn(function()
-    local TopBar = CoreGui:WaitForChild("TopBarApp", 10)
-
-    if TopBar then
-        local Inner = TopBar:FindFirstChild("TopBarApp")
-
-        if Inner then
-            pcall(function()
-                Inner.Enabled = false
-            end)
-        end
-    end
+Force(function()
+    StarterGui:SetCore("TopbarEnabled", false)
 end)
 
-task.spawn(function()
-    local Shield = RobloxGui:WaitForChild(
-        "SettingsClippingShield",
-        10
+Force(function()
+    StarterGui:SetCoreGuiEnabled(
+        Enum.CoreGuiType.PlayerList, false
     )
-
-    if Shield then
-        local SettingsShield = Shield:FindFirstChild("SettingsShield")
-        local Modal = SettingsShield
-            and SettingsShield:FindFirstChild("Modal")
-
-        if Modal then
-            Set(Modal, {
-                Visible = false,
-                Modal = false,
-            }, true)
-        end
-    end
-end)
-
-task.spawn(function()
-    local ControlFrame = RobloxGui:WaitForChild("ControlFrame", 10)
-
-    if ControlFrame then
-        ControlFrame:Destroy()
-    end
 end)
 
 --==================================================
--- CURSOR TRAIL + SPEED-RESPONSIVE BLUR
+-- CURSOR GUI
 --==================================================
 
 local CursorGui = Create("ScreenGui", {
     Name = "LegacyCursorEffects",
-    IgnoreGuiInset = true,
     ResetOnSpawn = false,
+    IgnoreGuiInset = true,
     DisplayOrder = 100000,
     ZIndexBehavior = Enum.ZIndexBehavior.Global,
-}, false, PlayerGui)
+}, PlayerGui)
 
--- The regular cursor remains enabled.
-pcall(function()
-    UserInputService.MouseIconEnabled = true
-end)
+-- Keep Roblox's actual cursor enabled. The trail is an overlay.
+UserInputService.MouseIconEnabled = true
 
-local InitialMouse = UserInputService:GetMouseLocation()
-local InitialPosition = Vector2.new(InitialMouse.X, InitialMouse.Y)
+local TrailEntries = {}
 
-local Trail = {}
-local TrailCount = math.clamp(Effects.TrailCount, 1, 16)
-
-for Index = 1, TrailCount do
-    local Image = Create("ImageLabel", {
-        Name = "ArrowTrail" .. Index,
-        AnchorPoint = Vector2.zero,
-        Position = UDim2.fromOffset(
-            InitialPosition.X,
-            InitialPosition.Y
-        ),
-        Size = UDim2.fromOffset(
-            24 * Effects.TrailScale,
-            24 * Effects.TrailScale
-        ),
+for index = 1, Effects.TrailCount do
+    local image = Create("ImageLabel", {
+        Name = "CursorTrail_" .. index,
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         Image = "rbxasset://textures/ArrowCursor.png",
+        ImageColor3 = Color3.fromRGB(255, 255, 255),
         ImageTransparency = 1,
-        Visible = false,
-        ZIndex = Index,
-    }, false, CursorGui)
+        AnchorPoint = Vector2.new(0, 0),
+        Size = UDim2.fromOffset(
+            36 * Effects.TrailScale,
+            36 * Effects.TrailScale
+        ),
+        Position = UDim2.fromOffset(-100, -100),
+        ZIndex = index,
+    }, CursorGui)
 
-    Trail[Index] = {
-        Image = Image,
-        Position = InitialPosition,
-        RenderPosition = InitialPosition,
+    TrailEntries[index] = {
+        Image = image,
+        Position = Vector2.new(-100, -100),
     }
 end
 
 local GamepadDot = Create("Frame", {
-    Name = "GamepadPointer",
+    Name = "GamepadCursor",
     AnchorPoint = Vector2.new(0.5, 0.5),
     Size = UDim2.fromOffset(Effects.DotSize, Effects.DotSize),
-    BackgroundColor3 = Color3.new(1, 1, 1),
+    Position = UDim2.fromOffset(-100, -100),
+    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
     BorderSizePixel = 0,
     Visible = false,
-    ZIndex = TrailCount + 1,
-}, false, CursorGui)
+    ZIndex = 100001,
+}, CursorGui)
 
 Create("UICorner", {
     CornerRadius = UDim.new(1, 0),
-}, false, GamepadDot)
+}, GamepadDot)
 
 Create("UIStroke", {
-    Color = Color3.new(0, 0, 0),
+    Color = Color3.fromRGB(20, 20, 20),
     Thickness = 1,
-}, false, GamepadDot)
+    Transparency = 0.1,
+}, GamepadDot)
 
--- Use a unique effect instance; do not modify unrelated blur effects.
-local CursorBlur
+--==================================================
+-- CURSOR BLUR
+--==================================================
 
-if Effects.MotionBlurEnabled then
-    CursorBlur = Create("BlurEffect", {
-        Name = "LegacyCursorMotionBlur",
-        Size = 0,
-        Enabled = true,
-    }, false, Lighting)
-end
+local CursorBlur = Create("BlurEffect", {
+    Name = "LegacyCursorMotionBlur",
+    Size = 0,
+    Enabled = Effects.MotionBlurEnabled,
+}, Lighting)
 
-local UsingGamepad = false
-local LastMousePosition = InitialPosition
+--==================================================
+-- SCROLL BLUR
+--==================================================
+
+local ScrollBlur = Create("BlurEffect", {
+    Name = "LegacyScrollBlur",
+    Size = 0,
+    Enabled = Effects.ScrollBlurEnabled,
+}, Lighting)
+
+--==================================================
+-- CURSOR TRACKING
+--==================================================
+
+local CursorPosition = UserInputService:GetMouseLocation()
+local PreviousCursorPosition = CursorPosition
 local CursorSpeed = 0
-local CurrentBlur = 0
+local MovementVisibility = 0
+local GamepadMode = false
 
-local function IsGamepad(InputType)
-    return string.match(InputType.Name, "^Gamepad") ~= nil
+local function IsGamepadInput(inputType)
+    return inputType == Enum.UserInputType.Gamepad1
+        or inputType == Enum.UserInputType.Gamepad2
+        or inputType == Enum.UserInputType.Gamepad3
+        or inputType == Enum.UserInputType.Gamepad4
 end
 
-local function UpdateInputMode(InputType)
-    if IsGamepad(InputType) then
-        UsingGamepad = true
+UserInputService.LastInputTypeChanged:Connect(function(inputType)
+    GamepadMode = IsGamepadInput(inputType)
+    GamepadDot.Visible = GamepadMode and Effects.GamepadDotEnabled
+end)
 
-    elseif InputType == Enum.UserInputType.MouseMovement
-        or InputType == Enum.UserInputType.MouseButton1
-        or InputType == Enum.UserInputType.MouseButton2
-        or InputType == Enum.UserInputType.MouseButton3
-        or InputType == Enum.UserInputType.Touch then
-
-        UsingGamepad = false
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        GamepadMode = false
+        GamepadDot.Visible = false
+    elseif IsGamepadInput(input.UserInputType) then
+        GamepadMode = true
+        GamepadDot.Visible = Effects.GamepadDotEnabled
     end
-
-    GamepadDot.Visible =
-        Effects.GamepadDotEnabled and UsingGamepad
-
-    for _, Entry in ipairs(Trail) do
-        Entry.Image.Visible =
-            Effects.TrailEnabled and not UsingGamepad
-    end
-end
-
-local InputConnection =
-    UserInputService.LastInputTypeChanged:Connect(UpdateInputMode)
-
-UpdateInputMode(UserInputService:GetLastInputType())
-
-local CursorRenderConnection
-
-CursorRenderConnection = RunService.RenderStepped:Connect(function(DeltaTime)
-    DeltaTime = math.min(DeltaTime, 0.05)
-
-    local Mouse = UserInputService:GetMouseLocation()
-    local Position = Vector2.new(Mouse.X, Mouse.Y)
-
-    local Distance = (Position - LastMousePosition).Magnitude
-    local InstantSpeed = Distance / math.max(DeltaTime, 1 / 240)
-
-    CursorSpeed +=
-        (math.min(InstantSpeed, Effects.TrailMaxSpeed) - CursorSpeed)
-        * SmoothAlpha(Effects.TrailSpeedResponse, DeltaTime)
-
-    if UsingGamepad then
-        GamepadDot.Position = UDim2.fromOffset(Position.X, Position.Y)
-    end
-
-    if Effects.TrailEnabled and not UsingGamepad then
-        -- The newest position is the real cursor location.
-        -- Each following image trails progressively behind it.
-        for Index = TrailCount, 2, -1 do
-            Trail[Index].Position = Trail[Index - 1].Position
-        end
-
-        Trail[1].Position = Position
-
-        for Index, Entry in ipairs(Trail) do
-            local Lag = (Index - 1) / math.max(1, TrailCount - 1)
-            local FollowSpeed = Effects.TrailFollowSpeed * (1 - Lag * 0.45)
-
-            Entry.RenderPosition = Entry.RenderPosition:Lerp(
-                Entry.Position,
-                SmoothAlpha(FollowSpeed, DeltaTime)
-            )
-
-            Entry.Image.Position = UDim2.fromOffset(
-                Entry.RenderPosition.X,
-                Entry.RenderPosition.Y
-            )
-
-            local Age = (Index - 1) / math.max(1, TrailCount - 1)
-            local MovementVisibility = math.clamp(
-                CursorSpeed / 500,
-                0,
-                1
-            )
-
-            Entry.Image.ImageTransparency = math.clamp(
-                1 - Effects.TrailOpacity * MovementVisibility * (1 - Age),
-                0,
-                1
-            )
-
-            Entry.Image.Visible = Distance > 0.1
-                and MovementVisibility > 0.01
-        end
-    else
-        for _, Entry in ipairs(Trail) do
-            Entry.Image.Visible = false
-        end
-    end
-
-    -- Speed-based blur. It fades quickly when the cursor stops.
-    if CursorBlur then
-        local TargetBlur = 0
-
-        if not UsingGamepad then
-            TargetBlur = math.clamp(
-                (CursorSpeed - Effects.MotionBlurThreshold)
-                    * Effects.MotionBlurStrength,
-                0,
-                Effects.MotionBlurMax
-            )
-        end
-
-        CurrentBlur +=
-            (TargetBlur - CurrentBlur)
-            * SmoothAlpha(Effects.MotionBlurFadeSpeed, DeltaTime)
-
-        CursorBlur.Size = CurrentBlur
-    end
-
-    LastMousePosition = Position
 end)
 
 --==================================================
--- SMOOTH SCROLLING
+-- SMOOTH SCROLL REGISTRATION
 --==================================================
 
 local ScrollFrames = {}
-local ScrollBlurAmount = 0
+local ScrollConnections = {}
 
-local ScrollBlur
-
-if Effects.ScrollBlurEnabled then
-    ScrollBlur = Create("BlurEffect", {
-        Name = "LegacyScrollBlur",
-        Size = 0,
-        Enabled = true,
-    }, false, Lighting)
-end
-
-local function RegisterScrollFrame(Object)
-    if not Object:IsA("ScrollingFrame") then
+local function RegisterScrollFrame(instance)
+    if not instance:IsA("ScrollingFrame") then
         return
     end
 
-    if ScrollFrames[Object] then
+    if ScrollFrames[instance] then
         return
     end
 
-    ScrollFrames[Object] = {
-        Target = Object.CanvasPosition,
-        Current = Object.CanvasPosition,
+    -- Avoid taking over frames that are not actually scrollable.
+    if instance.CanvasSize == UDim2.new(0, 0, 0, 0) then
+        return
+    end
+
+    ScrollFrames[instance] = {
+        Frame = instance,
+        Target = instance.CanvasPosition,
+        Current = instance.CanvasPosition,
+        Active = false,
     }
+
+    instance:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+        local data = ScrollFrames[instance]
+        if not data or data.Active then
+            return
+        end
+
+        -- Follow normal Roblox/UI scrolling if another system changes it.
+        data.Target = instance.CanvasPosition
+        data.Current = instance.CanvasPosition
+    end)
+
+    instance.Destroying:Connect(function()
+        ScrollFrames[instance] = nil
+    end)
 end
 
-local function RegisterRoot(Root)
-    if not Root then
-        return
+local function RegisterRoot(root)
+    for _, instance in ipairs(root:GetDescendants()) do
+        RegisterScrollFrame(instance)
     end
 
-    RegisterScrollFrame(Root)
+    local connection = root.DescendantAdded:Connect(
+        RegisterScrollFrame
+    )
 
-    for _, Object in ipairs(Root:GetDescendants()) do
-        RegisterScrollFrame(Object)
-    end
-
-    Root.DescendantAdded:Connect(RegisterScrollFrame)
+    table.insert(ScrollConnections, connection)
 end
 
 RegisterRoot(PlayerGui)
 
-pcall(function()
-    RegisterRoot(LegacyGui)
-end)
-
-local function GetScrollFrameAtMouse()
-    local Mouse = UserInputService:GetMouseLocation()
-    local Found = {}
-
-    local function CheckRoot(Root)
-        if not Root then
-            return
-        end
-
-        local Success, Objects = pcall(function()
-            return Root:GetGuiObjectsAtPosition(
-                math.floor(Mouse.X),
-                math.floor(Mouse.Y)
-            )
-        end)
-
-        if Success then
-            for _, Object in ipairs(Objects) do
-                table.insert(Found, Object)
-            end
-        end
-    end
-
-    CheckRoot(PlayerGui)
-
-    local Success, LegacyObjects = pcall(function()
-        return LegacyGui:GetGuiObjectsAtPosition(
-            math.floor(Mouse.X),
-            math.floor(Mouse.Y)
+local function GetScrollFrameAtMouse(position)
+    local ok, objects = pcall(function()
+        return PlayerGui:GetGuiObjectsAtPosition(
+            position.X,
+            position.Y
         )
     end)
 
-    if Success and LegacyObjects then
-        for _, Object in ipairs(LegacyObjects) do
-            table.insert(Found, Object)
-        end
+    if not ok or type(objects) ~= "table" then
+        return nil
     end
 
-    for Index = #Found, 1, -1 do
-        local Object = Found[Index]
-        local Parent = Object
+    for _, object in ipairs(objects) do
+        local current = object
 
-        while Parent do
-            if Parent:IsA("ScrollingFrame")
-                and ScrollFrames[Parent]
-                and Parent.Visible then
-
-                return Parent
+        while current and current ~= PlayerGui do
+            if current:IsA("ScrollingFrame")
+                and ScrollFrames[current] then
+                return current
             end
 
-            Parent = Parent.Parent
+            current = current.Parent
         end
     end
 
     return nil
 end
 
-UserInputService.InputChanged:Connect(function(Input, Processed)
-    if not Effects.SmoothScrolling or Processed then
-        return
-    end
-
-    if Input.UserInputType ~= Enum.UserInputType.MouseWheel then
-        return
-    end
-
-    local Frame = GetScrollFrameAtMouse()
-
-    if not Frame then
-        return
-    end
-
-    local Data = ScrollFrames[Frame]
-
-    if not Data then
-        return
-    end
-
-    local Canvas = Frame.AbsoluteCanvasSize
-    local Window = Frame.AbsoluteWindowSize
-
-    local MaxX = math.max(0, Canvas.X - Window.X)
-    local MaxY = math.max(0, Canvas.Y - Window.Y)
-
-    local Delta = Input.Position.Z * Effects.ScrollSpeed
-
-    Data.Target = Vector2.new(
-        math.clamp(Data.Target.X - Delta, 0, MaxX),
-        math.clamp(Data.Target.Y - Delta, 0, MaxY)
+local function ClampCanvasPosition(frame, position)
+    local maxX = math.max(
+        0,
+        frame.AbsoluteCanvasSize.X - frame.AbsoluteSize.X
     )
 
-    ScrollBlurAmount = Effects.ScrollBlurMax
-end)
+    local maxY = math.max(
+        0,
+        frame.AbsoluteCanvasSize.Y - frame.AbsoluteSize.Y
+    )
+
+    return Vector2.new(
+        math.clamp(position.X, 0, maxX),
+        math.clamp(position.Y, 0, maxY)
+    )
+end
+
+local ScrollBlurTarget = 0
+local LastWheelTime = 0
+
+-- Only intercept wheel input when an identifiable scrolling frame
+-- is under the pointer. Do not use "Processed" as the sole filter:
+-- Roblox can mark input processed before this script sees it.
+local ScrollInputConnection = UserInputService.InputChanged:Connect(
+    function(input, processed)
+        if not Effects.SmoothScrolling then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseWheel then
+            return
+        end
+
+        local mousePosition = UserInputService:GetMouseLocation()
+        local frame = GetScrollFrameAtMouse(mousePosition)
+
+        if not frame then
+            return
+        end
+
+        local data = ScrollFrames[frame]
+        if not data then
+            return
+        end
+
+        -- Use the wheel delta, then let RenderStepped animate the frame.
+        local delta = input.Position.Z
+        local direction = -delta * Effects.ScrollSpeed
+
+        data.Target = ClampCanvasPosition(
+            frame,
+            data.Target + Vector2.new(0, direction)
+        )
+
+        data.Active = true
+        LastWheelTime = os.clock()
+
+        if Effects.ScrollBlurEnabled then
+            ScrollBlurTarget = Effects.ScrollBlurMax
+        end
+    end
+)
 
 --==================================================
--- SMOOTH SCROLL / BLUR RENDER
+-- RENDER LOOP
 --==================================================
 
-local ScrollRenderConnection
+local LastCursorSpeed = 0
+local RenderConnection
 
-ScrollRenderConnection = RunService.RenderStepped:Connect(function(DeltaTime)
-    DeltaTime = math.min(DeltaTime, 0.05)
+RenderConnection = RunService.RenderStepped:Connect(function(deltaTime)
+    local currentPosition = UserInputService:GetMouseLocation()
 
-    for Frame, Data in pairs(ScrollFrames) do
-        if not Frame.Parent then
-            ScrollFrames[Frame] = nil
-        else
-            local Alpha = SmoothAlpha(
-                Effects.ScrollSmoothness,
-                DeltaTime
+    CursorPosition = currentPosition
+
+    local difference = CursorPosition - PreviousCursorPosition
+    local instantaneousSpeed = difference.Magnitude
+        / math.max(deltaTime, 1 / 240)
+
+    instantaneousSpeed = math.clamp(
+        instantaneousSpeed,
+        0,
+        Effects.TrailMaxSpeed
+    )
+
+    CursorSpeed += (
+        instantaneousSpeed - CursorSpeed
+    ) * SmoothAlpha(Effects.TrailSpeedResponse, deltaTime)
+
+    MovementVisibility = math.clamp(
+        CursorSpeed / 350,
+        0,
+        1
+    )
+
+    PreviousCursorPosition = CursorPosition
+    LastCursorSpeed = CursorSpeed
+
+    -- Place the newest trail entry near the actual cursor.
+    if Effects.TrailEnabled and not GamepadMode then
+        local head = TrailEntries[1]
+
+        if head then
+            head.Position = CursorPosition
+        end
+
+        for index = 2, #TrailEntries do
+            local entry = TrailEntries[index]
+            local previous = TrailEntries[index - 1]
+
+            local alpha = SmoothAlpha(
+                Effects.TrailFollowSpeed,
+                deltaTime
             )
 
-            Data.Current = Data.Current:Lerp(Data.Target, Alpha)
+            entry.Position = entry.Position:Lerp(
+                previous.Position,
+                alpha
+            )
+        end
 
-            if (Data.Current - Data.Target).Magnitude < 0.1 then
-                Data.Current = Data.Target
-            end
+        for index, entry in ipairs(TrailEntries) do
+            local age = (index - 1)
+                / math.max(1, #TrailEntries - 1)
 
-            if (Frame.CanvasPosition - Data.Current).Magnitude > 0.05 then
-                Frame.CanvasPosition = Data.Current
+            local transparency = math.clamp(
+                1 - Effects.TrailOpacity
+                    * MovementVisibility
+                    * ((1 - age) ^ Effects.TrailFadePower),
+                0,
+                1
+            )
+
+            entry.Image.Position = UDim2.fromOffset(
+                entry.Position.X,
+                entry.Position.Y
+            )
+
+            entry.Image.ImageTransparency = transparency
+            entry.Image.Visible = true
+        end
+    else
+        for _, entry in ipairs(TrailEntries) do
+            entry.Image.ImageTransparency = 1
+        end
+    end
+
+    -- Gamepad pointer overlay.
+    if GamepadMode and Effects.GamepadDotEnabled then
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize
+
+        if viewport then
+            local center = viewport / 2
+
+            GamepadDot.Position = UDim2.fromOffset(
+                center.X,
+                center.Y
+            )
+        end
+
+        GamepadDot.Visible = true
+    else
+        GamepadDot.Visible = false
+    end
+
+    -- Cursor-speed blur: low blur, fading quickly when motion stops.
+    if Effects.MotionBlurEnabled then
+        local speedAboveThreshold = math.max(
+            0,
+            CursorSpeed - Effects.MotionBlurThreshold
+        )
+
+        local targetBlur = math.clamp(
+            speedAboveThreshold * Effects.MotionBlurStrength,
+            0,
+            Effects.MotionBlurMax
+        )
+
+        CursorBlur.Size += (
+            targetBlur - CursorBlur.Size
+        ) * SmoothAlpha(Effects.MotionBlurFadeSpeed, deltaTime)
+    else
+        CursorBlur.Size = 0
+    end
+
+    -- Smooth scroll animation.
+    for frame, data in pairs(ScrollFrames) do
+        if not frame.Parent then
+            ScrollFrames[frame] = nil
+        else
+            local differencePosition = data.Target - frame.CanvasPosition
+
+            if differencePosition.Magnitude < 0.5 then
+                if data.Active then
+                    frame.CanvasPosition = data.Target
+                end
+
+                data.Active = false
+            elseif data.Active then
+                local alpha = SmoothAlpha(
+                    Effects.ScrollSmoothness,
+                    deltaTime
+                )
+
+                local nextPosition = frame.CanvasPosition:Lerp(
+                    data.Target,
+                    alpha
+                )
+
+                frame.CanvasPosition = ClampCanvasPosition(
+                    frame,
+                    nextPosition
+                )
             end
         end
     end
 
-    ScrollBlurAmount = math.max(
-        0,
-        ScrollBlurAmount - Effects.ScrollBlurFadeSpeed * DeltaTime
-    )
+    -- Brief, subtle blur during wheel scrolling.
+    if os.clock() - LastWheelTime > 0.12 then
+        ScrollBlurTarget = 0
+    end
 
-    if ScrollBlur then
-        local Target = Effects.ScrollBlurEnabled and ScrollBlurAmount or 0
-
-        ScrollBlur.Size += (Target - ScrollBlur.Size)
-            * SmoothAlpha(Effects.ScrollBlurFadeSpeed, DeltaTime)
+    if Effects.ScrollBlurEnabled then
+        ScrollBlur.Size += (
+            ScrollBlurTarget - ScrollBlur.Size
+        ) * SmoothAlpha(Effects.ScrollBlurFadeSpeed, deltaTime)
+    else
+        ScrollBlur.Size = 0
     end
 end)
 
@@ -869,23 +788,27 @@ end)
 --==================================================
 
 CursorGui.Destroying:Connect(function()
-    if CursorRenderConnection then
-        CursorRenderConnection:Disconnect()
+    if RenderConnection then
+        RenderConnection:Disconnect()
     end
 
-    if ScrollRenderConnection then
-        ScrollRenderConnection:Disconnect()
+    if ScrollInputConnection then
+        ScrollInputConnection:Disconnect()
     end
 
-    InputConnection:Disconnect()
+    for _, connection in ipairs(ScrollConnections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
 
-    if CursorBlur then
+    pcall(function()
         CursorBlur:Destroy()
-    end
+    end)
 
-    if ScrollBlur then
+    pcall(function()
         ScrollBlur:Destroy()
-    end
+    end)
 end)
 
-print("[Legacy] Cursor trail, motion blur and smooth scrolling initialized.")
+print("[Legacy] 2016 Branch initialized.")
