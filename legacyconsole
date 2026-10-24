@@ -1,6 +1,6 @@
 -- https://github.com/wally-rblx
 -- forked old dev console to support solara (no require support)
--- ENHANCED: Smooth motion + motion blur edition
+-- ENHANCED: smooth motion + soft fade-behind motion blur + fade-in typing
 
 local Instance_new = Instance.new
 local UDim2_new = UDim2.new
@@ -10,6 +10,7 @@ local math_min = math.min
 local math_floor = math.floor
 local math_abs = math.abs
 local math_exp = math.exp
+local math_clamp = math.clamp
 local tick = tick
 local pairs = pairs
 local os_time = os.time
@@ -107,17 +108,24 @@ local Style; do
 
         ChartGraphDirection = 1;
 
-        -- Smoothness tuning
-        PositionSmoothing = 22;   -- higher = snappier (used in 1-exp(-k*dt))
+        -- ======== TUNING: SMOOTHNESS ========
+        PositionSmoothing = 22;    -- drag/resize lerp speed (1-exp(-k*dt))
         SizeSmoothing     = 20;
-        DragSmoothing     = 28;
         ScrollSmoothing   = 14;
         ScrollFriction    = 6;
-        MotionBlurEnabled = true;
-        MotionBlurThreshold = 3;      -- px of movement before ghost spawns
-        MotionBlurLifetime  = 0.22;   -- seconds
-        MotionBlurMaxGhosts = 10;
-        MotionBlurBaseTransparency = 0.55;
+
+        -- ======== TUNING: MOTION BLUR ========
+        MotionBlurEnabled         = true;
+        MotionBlurThreshold       = 2.5;    -- px of frame delta before ghost spawns
+        MotionBlurLifetime        = 0.4;    -- long soft fade
+        MotionBlurMaxGhosts       = 14;
+        MotionBlurBaseTransparency = 0.88;  -- very ghosty start, fades to 1.0
+        MotionBlurFrameZIndex     = 2;      -- main frame
+        MotionBlurGhostZIndex     = 1;      -- ghost sits BEHIND the frame
+
+        -- ======== TUNING: TYPING FADE ========
+        MessageFadeDuration = 0.32;         -- new log lines fade in
+        CommandBarResizeDuration = 0.16;    -- command box grows smoothly
 
         GetButtonDownColor = function(normalColor)
             local r, g, b = normalColor.r, normalColor.g, normalColor.b
@@ -131,12 +139,11 @@ local Style; do
     Style.ChartHeight = Style.ChartTitleHeight + Style.ChartGraphHeight + Style.ChartDataHeight + Style.BorderSize
 end
 
---[[ FRAMERATE-INDEPENDENT SMOOTH LERP ]]--
 local function smoothAlpha(speed, dt)
     return 1 - math_exp(-speed * dt)
 end
 
---[[ MOTION BLUR SYSTEM ]]--
+--[[ MOTION BLUR: soft ghosts BEHIND the frame ]]--
 local MotionBlur = {}
 MotionBlur.__index = MotionBlur
 
@@ -148,7 +155,7 @@ function MotionBlur.new(screenGui, targetFrame)
     self.LastPos = nil
     self.LastSize = nil
     self.Conn = nil
-    self.Enabled = true
+    self.Enabled = Style.MotionBlurEnabled
     return self
 end
 
@@ -178,20 +185,18 @@ function MotionBlur:Update(dt)
     local pos = self.TargetFrame.AbsolutePosition
     local size = self.TargetFrame.AbsoluteSize
 
-    -- Age ghosts
+    -- Age ghosts with eased cubic-out fade
     for i = #self.Ghosts, 1, -1 do
         local g = self.Ghosts[i]
         g.Life = g.Life + dt
-        local a = g.Life / g.MaxLife
-        if a >= 1 then
+        local progress = g.Life / g.MaxLife
+        if progress >= 1 then
             if g.Frame then g.Frame:Destroy() end
             table.remove(self.Ghosts, i)
         else
             if g.Frame then
-                g.Frame.BackgroundTransparency = g.BaseTransparency + a * (1 - g.BaseTransparency)
-                -- shrink slightly for blur feel
-                local s = 1 - 0.04 * a
-                g.Frame.Size = UDim2.new(0, g.OrigSizeX * s, 0, g.OrigSizeY * s)
+                local eased = 1 - (1 - progress)^3  -- cubic out
+                g.Frame.BackgroundTransparency = g.BaseTransparency + eased * (1 - g.BaseTransparency)
             end
         end
     end
@@ -204,7 +209,7 @@ function MotionBlur:Update(dt)
         local movement = dx + dy + dw + dh
 
         if movement > Style.MotionBlurThreshold and #self.Ghosts < Style.MotionBlurMaxGhosts then
-            self:SpawnGhost(pos, size)
+            self:SpawnGhost(self.LastPos, self.LastSize)
         end
     end
 
@@ -217,7 +222,8 @@ function MotionBlur:SpawnGhost(pos, size)
     ghost.BackgroundColor3 = Style.FrameColor
     ghost.BackgroundTransparency = Style.MotionBlurBaseTransparency
     ghost.BorderSizePixel = 0
-    ghost.ZIndex = 1
+    ghost.ZIndex = Style.MotionBlurGhostZIndex
+    ghost.Active = false
     ghost.Position = UDim2.new(0, pos.X - self.ScreenGui.AbsolutePosition.X,
                                0, pos.Y - self.ScreenGui.AbsolutePosition.Y)
     ghost.Size = UDim2.new(0, size.X, 0, size.Y)
@@ -228,27 +234,20 @@ function MotionBlur:SpawnGhost(pos, size)
         Life = 0;
         MaxLife = Style.MotionBlurLifetime;
         BaseTransparency = Style.MotionBlurBaseTransparency;
-        OrigSizeX = size.X;
-        OrigSizeY = size.Y;
     })
 end
 
 --[[ SMOOTH FRAME ANIMATOR ]]--
--- A unified interpolator for position+size so drag/resize/whatever all glide smoothly.
 local SmoothFrame = {}
 SmoothFrame.__index = SmoothFrame
 
 function SmoothFrame.new(frame)
     local self = setmetatable({}, SmoothFrame)
     self.Frame = frame
-    self.tX = frame.Position.X.Offset
-    self.tY = frame.Position.Y.Offset
-    self.tW = frame.Size.X.Offset
-    self.tH = frame.Size.Y.Offset
-    self.cX = self.tX
-    self.cY = self.tY
-    self.cW = self.tW
-    self.cH = self.tH
+    self.tX, self.tY = frame.Position.X.Offset, frame.Position.Y.Offset
+    self.tW, self.tH = frame.Size.X.Offset, frame.Size.Y.Offset
+    self.cX, self.cY = self.tX, self.tY
+    self.cW, self.cH = self.tW, self.tH
     self.Conn = nil
     self.PosSpeed = Style.PositionSmoothing
     self.SizeSpeed = Style.SizeSmoothing
@@ -261,18 +260,14 @@ function SmoothFrame:Start()
     self.Conn = RunService.RenderStepped:Connect(function(dt)
         local aPos = smoothAlpha(self.PosSpeed, dt)
         local aSize = smoothAlpha(self.SizeSpeed, dt)
-
         self.cX = self.cX + (self.tX - self.cX) * aPos
         self.cY = self.cY + (self.tY - self.cY) * aPos
         self.cW = self.cW + (self.tW - self.cW) * aSize
         self.cH = self.cH + (self.tH - self.cH) * aSize
-
-        -- snap when close
         if math_abs(self.tX - self.cX) < self.SnapEps then self.cX = self.tX end
         if math_abs(self.tY - self.cY) < self.SnapEps then self.cY = self.tY end
         if math_abs(self.tW - self.cW) < self.SnapEps then self.cW = self.tW end
         if math_abs(self.tH - self.cH) < self.SnapEps then self.cH = self.tH end
-
         self.Frame.Position = UDim2.new(0, self.cX, 0, self.cY)
         self.Frame.Size = UDim2.new(0, self.cW, 0, self.cH)
     end)
@@ -286,13 +281,11 @@ function SmoothFrame:Stop()
 end
 
 function SmoothFrame:SetTargetPosition(x, y)
-    self.tX = x
-    self.tY = y
+    self.tX, self.tY = x, y
 end
 
 function SmoothFrame:SetTargetSize(w, h)
-    self.tW = w
-    self.tH = h
+    self.tW, self.tH = w, h
 end
 
 function SmoothFrame:Snap(x, y, w, h)
@@ -300,12 +293,8 @@ function SmoothFrame:Snap(x, y, w, h)
     if y then self.tY = y; self.cY = y end
     if w then self.tW = w; self.cW = w end
     if h then self.tH = h; self.cH = h end
-    if x and y then
-        self.Frame.Position = UDim2.new(0, self.cX, 0, self.cY)
-    end
-    if w and h then
-        self.Frame.Size = UDim2.new(0, self.cW, 0, self.cH)
-    end
+    if x and y then self.Frame.Position = UDim2.new(0, self.cX, 0, self.cY) end
+    if w and h then self.Frame.Size = UDim2.new(0, self.cW, 0, self.cH) end
 end
 
 local Primitives = {}; do
@@ -445,30 +434,22 @@ local function CreateSignal()
     this.Disconnect = this.disconnect
     this.Wait = this.wait
     this.Fire = this.fire
-
     return this
 end
 
 local CreateDisconnectSignal; do
     local Methods = {}
     local Metatable = {__index = Methods}
-    function Methods.fire(this, ...)
-        return this.Signal:fire(...)
-    end
-    function Methods.wait(this, ...)
-        return this.Signal:wait(...)
-    end
+    function Methods.fire(this, ...) return this.Signal:fire(...) end
+    function Methods.wait(this, ...) return this.Signal:wait(...) end
     function Methods.connect(this, func)
         local t = type(func)
         if t == 'table' or t == 'userdata' then
             local listener = func
-            function func()
-                listener:disconnect()
-            end
+            function func() listener:disconnect() end
         elseif t ~= 'function' then
             error('Invalid disconnect method type: ' .. t, 2)
         end
-
         local listener;
         listener = this.Signal:connect(function(...)
             if listener then
@@ -480,9 +461,7 @@ local CreateDisconnectSignal; do
         return listener
     end
     function CreateDisconnectSignal()
-        return setmetatable({
-            Signal = CreateSignal();
-        }, Metatable)
+        return setmetatable({ Signal = CreateSignal(); }, Metatable)
     end
 end
 
@@ -497,29 +476,22 @@ local Metatable = {__index = Methods}
 
 function Methods.ConnectSetVisible(devConsole, func)
     func(devConsole.Visible)
-    return devConsole.VisibleChanged:connect(function(visible)
-        func(visible)
-    end)
+    return devConsole.VisibleChanged:connect(function(visible) func(visible) end)
 end
 function Methods.ConnectObjectSetVisible(devConsole, object, func)
     func(object, devConsole.Visible)
-    return devConsole.VisibleChanged:connect(function(visible)
-        func(object, visible)
-    end)
+    return devConsole.VisibleChanged:connect(function(visible) func(object, visible) end)
 end
 
 local function connectPropertyChanged(object, property, callback)
     return object.Changed:connect(function(propertyChanged)
-        if propertyChanged == property then
-            callback(object[property])
-        end
+        if propertyChanged == property then callback(object[property]) end
     end)
 end
 
 function Methods.ResetFrameDimensions(devConsole)
     local sf = devConsole.SmoothFrame
     if sf then
-        -- Keep current smooth size but reset to center
         local curW = sf.cW > 0 and sf.cW or 500
         local curH = sf.cH > 0 and sf.cH or 350
         curW, curH = devConsole:BoundFrameSize(curW, curH)
@@ -616,6 +588,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
     frame.AutoButtonColor = false
     frame.Visible = devConsole.Visible
     frame.Selectable = not isTenFootInterface
+    frame.ZIndex = Style.MotionBlurFrameZIndex   -- >>> render ABOVE ghost
 
     local function onVREnabled()
         frame.Modal = VRService.VREnabled
@@ -625,9 +598,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
 
     devConsole.Frame = frame
 
-    -- Initialize smooth systems
     local sf = SmoothFrame.new(frame)
-    -- start sized at default
     sf:Snap(0, 0, 500, 350)
     sf:Start()
     devConsole.SmoothFrame = sf
@@ -637,7 +608,6 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
 
     devConsole:ResetFrameDimensions()
 
-    -- Handle bar
     local handle = Primitives.Button(frame, 'Handle')
     handle.Size = UDim2_new(1, -(Style.HandleHeight + Style.BorderSize), 0, Style.HandleHeight)
     handle.Selectable = not isTenFootInterface
@@ -661,7 +631,6 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
         local button = Primitives.Button(frame, name)
         button.Size = UDim2_new(0, Style.HandleHeight, 0, Style.HandleHeight)
         button.Position = UDim2_new(x, -x * Style.HandleHeight, y, -y * Style.HandleHeight)
-
         local buttonImage = Primitives.InvisibleImageLabel(button, 'Image', image)
         setCornerButtonImageSize(buttonImage, buttonImageSize)
         return button, buttonImage
@@ -797,10 +766,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
                 f.Size = UDim2_new(xs, ys * padding, ys, xs * padding)
                 f.Position = UDim2_new(xp, -xp * padding, yp, -yp * padding)
             end
-            f(1, 0, 0)
-            f(1, 0, 1)
-            f(0, 0, 0)
-            f(0, 1, 0)
+            f(1, 0, 0); f(1, 0, 1); f(0, 0, 0); f(0, 1, 0)
 
             local button = Primitives.Button(frame, 'Button')
             button.Size = UDim2_new(1, -padding * 2, 1, -padding * 2)
@@ -824,14 +790,12 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
                 callback(value)
             end
 
-            button.MouseButton1Click:connect(function()
-                this:SetValue(not this.Value)
-            end)
+            button.MouseButton1Click:connect(function() this:SetValue(not this.Value) end)
             return this
         end
 
         local string_find = string.find
-        local containsString;
+        local containsString
 
         function textFilter(text)
             return not containsString or string_find(text:lower(), containsString)
@@ -897,7 +861,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
             end
         end
 
-        do -- Scripts options
+        do -- Stats options
             local container = Primitives.FolderFrame(optionsFrame, 'Stats')
             container.Visible = false
             optionTypeContainers.Scripts = container
@@ -917,9 +881,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
                         local stats = chartStat.Stats
                         if stats then
                             local stat = stats[#stats]
-                            if stat then
-                                return stat[1] > 0.000001 or stat[2] > 0.000001
-                            end
+                            if stat then return stat[1] > 0.000001 or stat[2] > 0.000001 end
                         end
                         return false
                     end
@@ -986,40 +948,27 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
             local disconnector = CreateDisconnectSignal()
 
             local tab = devConsole:AddTab(text, tabBody, function(open)
-                if commandLine then
-                    commandLine.Frame.Visible = open
-                end
+                if commandLine then commandLine.Frame.Visible = open end
 
                 if open then
-                    setShownOptionTypes({
-                        Log = true;
-                        Search = true;
-                    })
+                    setShownOptionTypes({ Log = true; Search = true; })
 
                     if not output then
                         output = devConsole:CreateOutput(outputMessageSync:GetMessages(), messageFilter)
                         output.Frame.Parent = tabBody
                     end
-
                     output:SetVisible(true)
 
                     if commandLineVisible then
                         if open and not commandLine then
                             commandLine = devConsole:CreateCommandLine()
                             commandLine.Frame.Parent = frame
-                            commandLine.Frame.Size = UDim2_new(1,
-                                -(Style.HandleHeight + Style.BorderSize * 2),
-                                0,
-                                Style.CommandLineHeight)
-                            commandLine.Frame.Position = UDim2_new(0,
-                                Style.BorderSize,
-                                1,
-                                -(Style.CommandLineHeight + Style.BorderSize))
+                            commandLine.Frame.Size = UDim2_new(1, -(Style.HandleHeight + Style.BorderSize * 2), 0, Style.CommandLineHeight)
+                            commandLine.Frame.Position = UDim2_new(0, Style.BorderSize, 1, -(Style.CommandLineHeight + Style.BorderSize))
                             commandLine.CommandInputted:connect(commandInputtedCallback)
                         end
                     end
 
-                    -- Smooth transition of window size using TweenService
                     TweenService:Create(window, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
                         Size = commandLineVisible and UDim2_new(1, 0, 1, -(Style.HandleHeight)) or UDim2_new(1, 0, 1, 0)
                     }):Play()
@@ -1036,17 +985,12 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
                     disconnector:connect(outputMessageSync.MessageAdded:connect(function(message)
                         output:RefreshMessages(#messages)
                     end))
-
-                    disconnector:connect(messageFilterChanged:connect(function()
-                        output:RefreshMessages()
-                    end))
+                    disconnector:connect(messageFilterChanged:connect(function() output:RefreshMessages() end))
                     disconnector:connect(messageTextWrappedChanged:connect(function(enabled)
                         output:SetTextWrappedEnabled(enabled)
                     end))
                 else
-                    if output then
-                        output:SetVisible(false)
-                    end
+                    if output then output:SetVisible(false) end
                     TweenService:Create(window, TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
                         Size = UDim2_new(1, 0, 1, 0)
                     }):Play()
@@ -1066,10 +1010,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
                 function(text)
                     if #text <= 1 then return end
                     local f, err = loadstring(text)
-                    if err then
-                        warn(err)
-                        return
-                    end
+                    if err then warn(err); return end
                     f();
                 end
             )
@@ -1125,7 +1066,7 @@ do
     end
 end
 
-do -- Command Line
+do -- Command Line with SMOOTH resize
     function Methods.CreateCommandLine(devConsole)
         local this = { CommandInputted = CreateSignal(); }
 
@@ -1169,9 +1110,11 @@ do -- Command Line
             textBox.SelectionImageObject = selectionImage
         end
 
-        do
+        do -- SMOOTH textbox resize
             local defaultSize = UDim2_new(1, 0, 0, Style.CommandLineHeight)
             local first = true
+            local lastTarget = nil
+
             textBox.Changed:connect(function(property)
                 if property == 'TextBounds' or property == 'AbsoluteSize' then
                     if first then
@@ -1179,11 +1122,16 @@ do -- Command Line
                         return
                     end
                     local textBounds = textBox.TextBounds
-                    if textBounds.Y > Style.CommandLineHeight then
-                        textBoxFrame.Size = UDim2_new(1, 0, 0, textBounds.Y + 2)
-                    else
-                        textBoxFrame.Size = defaultSize
-                    end
+                    local targetSize = (textBounds.Y > Style.CommandLineHeight)
+                        and UDim2_new(1, 0, 0, textBounds.Y + 2)
+                        or defaultSize
+                    if targetSize == lastTarget then return end
+                    lastTarget = targetSize
+                    TweenService:Create(textBoxFrame, TweenInfo.new(
+                        Style.CommandBarResizeDuration,
+                        Enum.EasingStyle.Quad,
+                        Enum.EasingDirection.Out
+                    ), { Size = targetSize }):Play()
                 end
             end)
         end
@@ -1255,7 +1203,7 @@ do -- Command Line
     end
 end
 
-do -- Output
+do -- Output with SMOOTH typing fade-in
     local padding = 5
     local LabelSize = UDim2_new(1, -padding, 0, 2048)
     local TextColors = Style.MessageColors
@@ -1342,6 +1290,7 @@ do -- Output
                     labelPosition = labelPosition + 1
                     labelPositions[i] = labelPosition
                     local label = labels[labelPosition]
+                    local isNewLabel = false
                     if not label then
                         label = Instance_new('TextLabel', frame)
                         label.ZIndex = Style.ZINDEX
@@ -1349,12 +1298,24 @@ do -- Output
                         label.FontSize = 'Size10'
                         label.TextXAlignment = 'Left'
                         label.TextYAlignment = 'Top'
+                        -- >>> start invisible for smooth typing fade
+                        label.TextTransparency = 1
                         labels[labelPosition] = label
+                        isNewLabel = true
                     end
                     label.TextWrapped = textWrappedEnabled
                     label.Size = LabelSize
                     label.TextColor3 = TextColors[message.Type] or TextColorUnknown
                     label.Text = message.Time .. " -- " .. message.Message
+
+                    if isNewLabel then
+                        -- >>> SMOOTH TYPING FADE-IN
+                        TweenService:Create(label, TweenInfo.new(
+                            Style.MessageFadeDuration,
+                            Enum.EasingStyle.Quad,
+                            Enum.EasingDirection.Out
+                        ), { TextTransparency = 0 }):Play()
+                    end
 
                     local height = label.TextBounds.Y
                     label.Size = LabelSize
@@ -1434,7 +1395,6 @@ function Methods.RefreshTabs(devConsole)
         local tab = tabs[i]
         if tab.ButtonFrame.Visible then
             x = x + 3
-            -- Smooth tab reposition
             local targetPos = UDim2_new(0, x, 0, 0)
             if tab._lastPos ~= targetPos then
                 tab._lastPos = targetPos
@@ -1501,13 +1461,10 @@ function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
             end
             local tabs = devConsole.Tabs
             for i = 1, #tabs do
-                if tabs[i] ~= tab then
-                    tabs[i]:SetOpen(false)
-                end
+                if tabs[i] ~= tab then tabs[i]:SetOpen(false) end
             end
             if body then body.Visible = true end
             devConsole:RefreshTabs()
-            -- Smooth label grow
             TweenService:Create(textLabel, TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
                 Size = size1;
                 Position = position1;
@@ -1515,13 +1472,11 @@ function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
             devConsole.CurrentOpenedTab = buttonFrame
         else
             tab.SavedScrollbarValue = devConsole.WindowScrollbar:GetValue()
-
             if body then
                 body.Visible = false
                 devConsole.Frame.Interior.WindowContainer.Window.Body.Size = UDim2_new(1, 0, 1, 0)
                 devConsole.Frame.Interior.WindowContainer.Window.Body.Position = UDim2_new(0, 0, 0, 0)
             end
-
             TweenService:Create(textLabel, TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
                 Size = size0;
                 Position = position0;
@@ -1542,26 +1497,22 @@ function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
     return tab
 end
 
---[[ SCROLLBAR WITH SMOOTH MOMENTUM ]]--
 function Methods.ApplyScrollbarToFrame(devConsole, scrollbar, window, body, frame)
     local windowHeight, bodyHeight
     local height = scrollbar:GetHeight()
     local value = scrollbar:GetValue()
 
-    -- Smooth scroll state
     local targetY = 0
     local currentY = 0
     local velocityY = 0
     local scrollConn = nil
     local active = false
 
-    local function getHeights()
-        return window.AbsoluteSize.Y, body.AbsoluteSize.Y
-    end
+    local function getHeights() return window.AbsoluteSize.Y, body.AbsoluteSize.Y end
 
     local function clampY(y, bodyH, windowH)
         local maxY = math_max(0, bodyH - windowH)
-        return math.clamp(y, -maxY, 0)
+        return math_clamp(y, -maxY, 0)
     end
 
     local function refreshDimension()
@@ -1579,45 +1530,37 @@ function Methods.ApplyScrollbarToFrame(devConsole, scrollbar, window, body, fram
         scrollConn = RunService.RenderStepped:Connect(function(dt)
             local a = smoothAlpha(Style.ScrollSmoothing, dt)
             local newY = currentY + (targetY - currentY) * a
-            -- apply momentum with velocity
             if math_abs(velocityY) > 0.5 then
                 targetY = targetY + velocityY * dt
                 velocityY = velocityY * math_exp(-Style.ScrollFriction * dt)
-                -- clamp target
                 local _, bodyH = getHeights()
                 local winH = window.AbsoluteSize.Y
                 targetY = clampY(targetY, bodyH, winH)
             end
-
             if math_abs(targetY - currentY) < 0.1 and math_abs(velocityY) <= 0.5 then
                 currentY = targetY
                 body.Position = UDim2_new(body.Position.X.Scale, body.Position.X.Offset, 0, math_floor(currentY))
-                if not scrollConn then return end
-                scrollConn:Disconnect()
-                scrollConn = nil
+                if scrollConn then scrollConn:Disconnect(); scrollConn = nil end
                 active = false
                 return
             end
-
             currentY = newY
             body.Position = UDim2_new(body.Position.X.Scale, body.Position.X.Offset, 0, math_floor(currentY))
         end)
     end
 
     local function setTargetValue(valueNew, addVelocity)
-        value = math.clamp(valueNew, 0, 1)
+        value = math_clamp(valueNew, 0, 1)
         local windowH, bodyH = getHeights()
         if bodyH == 0 then return end
         local maxScroll = math_max(0, bodyH - windowH)
         targetY = -value * maxScroll
-        if addVelocity then
-            velocityY = velocityY + addVelocity
-        end
+        if addVelocity then velocityY = velocityY + addVelocity end
         startSmooth()
     end
 
     local function setValueImmediate(valueNew)
-        value = math.clamp(valueNew, 0, 1)
+        value = math_clamp(valueNew, 0, 1)
         local windowH, bodyH = getHeights()
         if bodyH == 0 then return end
         local maxScroll = math_max(0, bodyH - windowH)
@@ -1628,13 +1571,9 @@ function Methods.ApplyScrollbarToFrame(devConsole, scrollbar, window, body, fram
     end
 
     scrollbar.ValueChanged:connect(function(newValue)
-        -- If this came from user (external SetValue), sync target
-        if not active then
-            setValueImmediate(newValue)
-        end
+        if not active then setValueImmediate(newValue) end
     end)
 
-    -- Track whether internal scrollbar fired from our own update
     local suppressSignal = false
     local origSetValue = scrollbar.SetValue
     function scrollbar.SetValue(s, v)
@@ -1653,17 +1592,11 @@ function Methods.ApplyScrollbarToFrame(devConsole, scrollbar, window, body, fram
 
     scrollbar.ButtonUp.MouseButton1Click:connect(function()
         local winH, bodyH = getHeights()
-        if bodyH > 0 then
-            local dvalue = -scrollDistance / bodyH
-            scrollbar:SetValue(scrollbar:GetValue() + dvalue)
-        end
+        if bodyH > 0 then scrollbar:SetValue(scrollbar:GetValue() - scrollDistance / bodyH) end
     end)
     scrollbar.ButtonDown.MouseButton1Click:connect(function()
         local winH, bodyH = getHeights()
-        if bodyH > 0 then
-            local dvalue = scrollDistance / bodyH
-            scrollbar:SetValue(scrollbar:GetValue() + dvalue)
-        end
+        if bodyH > 0 then scrollbar:SetValue(scrollbar:GetValue() + scrollDistance / bodyH) end
     end)
 
     connectPropertyChanged(window, 'AbsoluteSize', refreshDimension)
@@ -1671,23 +1604,16 @@ function Methods.ApplyScrollbarToFrame(devConsole, scrollbar, window, body, fram
     local function smoothScrollBy(amount)
         local winH, bodyH = getHeights()
         if bodyH <= 0 then return end
-        local dvalue = amount / bodyH
-        scrollbar:SetValue(scrollbar:GetValue() + dvalue)
+        scrollbar:SetValue(scrollbar:GetValue() + amount / bodyH)
     end
 
-    window.MouseWheelForward:connect(function()
-        smoothScrollBy(-scrollDistance)
-    end)
-    window.MouseWheelBackward:connect(function()
-        smoothScrollBy(scrollDistance)
-    end)
+    window.MouseWheelForward:connect(function() smoothScrollBy(-scrollDistance) end)
+    window.MouseWheelBackward:connect(function() smoothScrollBy(scrollDistance) end)
     window.TouchPan:connect(function(positions, delta, velocity, userInputState)
         local winH, bodyH = getHeights()
         if bodyH <= 0 then return end
-        local dvalue = -delta.y / bodyH
-        -- Touch pan gets momentum
         velocityY = velocityY + (-velocity.y * 0.5)
-        scrollbar:SetValue(scrollbar:GetValue() + dvalue)
+        scrollbar:SetValue(scrollbar:GetValue() + (-delta.y / bodyH))
     end)
 end
 
@@ -1746,7 +1672,6 @@ function Methods.CreateScrollbar(devConsole, rotation)
     local heightChanged = CreateSignal()
     scrollbar.HeightChanged = heightChanged
 
-    -- Smooth bar position
     local barTargetPos = value * (1 - height)
     local barCurrentPos = barTargetPos
     local barTargetSize = height
@@ -1768,10 +1693,7 @@ function Methods.CreateScrollbar(devConsole, rotation)
                 barCurrentPos = barTargetPos
                 barCurrentSize = barTargetSize
                 refreshBar()
-                if barAnimConn then
-                    barAnimConn:Disconnect()
-                    barAnimConn = nil
-                end
+                if barAnimConn then barAnimConn:Disconnect(); barAnimConn = nil end
                 return
             end
             refreshBar()
@@ -1786,23 +1708,19 @@ function Methods.CreateScrollbar(devConsole, rotation)
     refreshBar()
 
     function scrollbar.SetValue(scrollbar, valueNew)
-        valueNew = math.clamp(valueNew, 0, 1)
+        valueNew = math_clamp(valueNew, 0, 1)
         if valueNew ~= value then
             value = valueNew
             refresh()
             valueChanged:fire(valueNew)
         end
     end
-    function scrollbar.GetValue(scrollbar)
-        return value
-    end
-
+    function scrollbar.GetValue(scrollbar) return value end
     function scrollbar.Scroll(scrollbar, direction, windowHeight, bodyHeight)
         scrollbar:SetValue(value + direction / bodyHeight)
     end
-
     function scrollbar.SetHeight(scrollbar, heightNew)
-        heightNew = math.max(math.clamp(heightNew, 0, 1), 0.1)
+        heightNew = math.max(math_clamp(heightNew, 0, 1), 0.1)
         if heightNew ~= height then
             height = heightNew
             scrollbar:SetVisible(heightNew < 1)
@@ -1810,15 +1728,12 @@ function Methods.CreateScrollbar(devConsole, rotation)
             heightChanged:fire(heightNew)
         end
     end
-    function scrollbar.GetHeight(scrollbar)
-        return height
-    end
+    function scrollbar.GetHeight(scrollbar) return height end
 
     devConsole:ConnectButtonDragging(bar, function()
         local value0 = value
         return function(dx, dy)
-            local dposition = dy
-            local dvalue = (dposition / frame.AbsoluteSize.Y) / (1 - height)
+            local dvalue = (dy / frame.AbsoluteSize.Y) / (1 - height)
             scrollbar:SetValue(value0 + dvalue)
         end
     end, buttonEffectFunction)
@@ -1926,13 +1841,10 @@ end
 do
     local globalInteractEvent = CreateSignal()
     function Methods.ConnectButtonHover(devConsole, button, mouseInteractCallback)
-        local this = {}
         local clicking = false
         local hovering = false
         local function set(clickingNew, hoveringNew)
-            if hoveringNew and TouchEnabled then
-                hoveringNew = false
-            end
+            if hoveringNew and TouchEnabled then hoveringNew = false end
             if clickingNew ~= clicking or hoveringNew ~= hovering then
                 clicking, hovering = clickingNew, hoveringNew
                 mouseInteractCallback(clicking, hovering)
@@ -1946,7 +1858,6 @@ do
     end
 end
 
---[[ SMOOTH DRAGGING - uses target-based dragging so the SmoothFrame lerp handles the motion ]]--
 function Methods.ConnectButtonDragging(devConsole, button, dragCallback, mouseInteractCallback)
     local dragging = false
     local hovering = false
@@ -1968,8 +1879,6 @@ function Methods.ConnectButtonDragging(devConsole, button, dragCallback, mouseIn
         [Enum.UserInputType.Touch] = true;
     }
 
-    local mouse = game:GetService("Players").LocalPlayer:GetMouse()
-
     local function startDragging(startP)
         if dragging then return end
         dragging = true
@@ -1978,9 +1887,7 @@ function Methods.ConnectButtonDragging(devConsole, button, dragCallback, mouseIn
         local x0, y0 = startP.X, startP.Y
 
         listeners[#listeners + 1] = UserInputService.InputEnded:connect(function(input)
-            if ButtonUserInputTypes[input.UserInputType] then
-                stopDragging()
-            end
+            if ButtonUserInputTypes[input.UserInputType] then stopDragging() end
         end)
         listeners[#listeners + 1] = UserInputService.InputChanged:connect(function(input)
             if not (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
@@ -1992,9 +1899,7 @@ function Methods.ConnectButtonDragging(devConsole, button, dragCallback, mouseIn
             if not deltaCallback then
                 deltaCallback, disconnectCallback = dragCallback(x0 or x1, y0 or y1)
             end
-            if x0 then
-                deltaCallback(x1 - x0, y1 - y0)
-            end
+            if x0 then deltaCallback(x1 - x0, y1 - y0) end
         end)
     end
 
@@ -2044,9 +1949,7 @@ do
             success, result = pcall(function()
                 return game:GetService('HttpService'):JSONDecode(result)
             end)
-            if success and result.CanManage == true then
-                permissions.IsCreator = result.CanManage
-            end
+            if success and result.CanManage == true then permissions.IsCreator = result.CanManage end
         end
 
         permissions.ClientCodeExecutionEnabled = false
@@ -2061,21 +1964,14 @@ do
 
         permissions.MayViewServerLog = permissions.IsCreator
         permissions.MayViewClientLog = true
-
         permissions.MayViewServerStats = permissions.IsCreator
         permissions.MayViewServerMemory = permissions.IsCreator
         permissions.MayViewServerScripts = permissions.IsCreator
         permissions.MayViewServerJobs = permissions.IsCreator
-
         permissions.MayViewDataStoreBudget = false
-        pcall(function()
-            permissions.MayViewDataStoreBudget = permissions.IsCreator
-        end)
-        permissions.MayViewHttpResultClient = false
+        pcall(function() permissions.MayViewDataStoreBudget = permissions.IsCreator end)
         permissions.MayViewHttpResultClient = permissions.IsCreator
-        permissions.MayViewHttpResultServer = false
         permissions.MayViewHttpResultServer = permissions.IsCreator
-
         permissions.MayViewContextActionBindings = permissions.IsCreator
 
         permissionsLoading = false
@@ -2111,9 +2007,7 @@ do
         end
 
         local ConvertTimeStamp; do
-            local function numberWithZero(num)
-                return (num < 10 and "0" or "") .. num
-            end
+            local function numberWithZero(num) return (num < 10 and "0" or "") .. num end
             local string_format = string.format
             function ConvertTimeStamp(timeStamp)
                 local localTime = timeStamp - os_time() + math_floor(tick())
@@ -2122,23 +2016,16 @@ do
                 dayTime = dayTime - (hour * 3600)
                 local minute = math_floor(dayTime/60)
                 dayTime = dayTime - (minute * 60)
-                local h = numberWithZero(hour)
-                local m = numberWithZero(minute)
-                local s = numberWithZero(dayTime)
-                return string_format("%s:%s:%s", h, m, s)
+                return string_format("%s:%s:%s", numberWithZero(hour), numberWithZero(minute), numberWithZero(dayTime))
             end
         end
 
         local warningsToFilter = {"ClassDescriptor failed to learn", "EventDescriptor failed to learn", "Type failed to learn"}
-
         local function filterMessageOnAdd(message)
             if message.Type ~= Enum.MessageType.MessageWarning.Value then return false end
             local found = false
             for _, filterString in ipairs(warningsToFilter) do
-                if string.find(message.Message, filterString) ~= nil then
-                    found = true
-                    break
-                end
+                if string.find(message.Message, filterString) ~= nil then found = true; break end
             end
             return found
         end
@@ -2162,7 +2049,6 @@ do
                         end
                     end
                 end
-
                 LogService.MessageOut:connect(function(text, messageType)
                     local message = {
                         Message = text or "[DevConsole Error 2]";
@@ -2174,7 +2060,6 @@ do
                         this.MessageAdded:fire(message)
                     end
                 end)
-
                 return messages
             end)
         end
@@ -2202,10 +2087,7 @@ do
 
         local statsSyncServer;
         if (permissions.MayViewServerStats or permissions.MayViewServerScripts or permissions.MayViewServerMemory) then
-            statsSyncServer = {
-                Stats = nil;
-                StatsReceived = CreateSignal();
-            }
+            statsSyncServer = { Stats = nil; StatsReceived = CreateSignal(); }
             local statsListenerConnection;
             function statsSyncServer.GetStats(statsSyncServer)
                 local stats = statsSyncServer.Stats
@@ -2244,9 +2126,7 @@ local function onDevConsoleVisibilityChanged(isVisible)
     local selectionParentName = "devConsoleSelectionGroup"
 
     local function closeDevConsole(actionName, inputState, inputObject)
-        if inputState == Enum.UserInputState.End then
-            myDeveloperConsole:SetVisible(false)
-        end
+        if inputState == Enum.UserInputState.End then myDeveloperConsole:SetVisible(false) end
     end
 
     if isVisible then
@@ -2254,9 +2134,7 @@ local function onDevConsoleVisibilityChanged(isVisible)
         local Settings = Modules and Modules:FindFirstChild("Settings")
         local SettingsHub = Settings and Settings:FindFirstChild("SettingsHub")
         local MenuModule = SafeRequire(SettingsHub)
-        if (MenuModule) then
-            MenuModule:SetVisibility(false, true)
-        end
+        if (MenuModule) then MenuModule:SetVisibility(false, true) end
         ContextActionService:BindCoreAction(closeDevConsoleActionName, closeDevConsole, false, Enum.KeyCode.ButtonB)
         GuiService:AddSelectionParent(selectionParentName, myDeveloperConsole.Frame)
         GuiService.SelectedCoreObject = myDeveloperConsole.CurrentOpenedTab
