@@ -1,270 +1,719 @@
+
 --[[
- ___       _______   ________  ________  ________      ___    ___ 
-|\  \     |\  ___ \ |\   ____\|\   __  \|\   ____\    |\  \  /  /|
-\ \  \    \ \   __/|\ \  \___|\ \  \|\  \ \  \___|    \ \  \/  / /
- \ \  \    \ \  \_|/_\ \  \  __\ \   __  \ \  \        \ \    / / 
-  \ \  \____\ \  \_|\ \ \  \|\  \ \  \ \  \ \  \____    \/   / /  
-   \ \_______\ \_______\ \_______\ \__\ \__\ \_______\__/   / /   
-    \|_______|\|_______|\|_______|\|__|\|__|\|_______|\____/ /    
-                                                     \|____|/     
-                                                                  
-> github.com/yeku/legacy
->> a ROBLOX coregui changer that lets you use older designs
-[!] only supports 2012, 2013, 2014, 2015, 2016
+    LEGACY + SMOOTH UI EFFECTS
+    Original Legacy setup with smooth cursor, scrolling and UI transitions.
+
+    Note:
+    - Cursor trails simulate motion blur.
+    - BlurEffect affects the 3D scene, not ScreenGui elements.
+    - Smooth scrolling is applied to mouse-wheel scrolling frames.
 ]]
 
-if (not game:IsLoaded()) then
-	game.Loaded:Wait()
+if not game:IsLoaded() then
+    game.Loaded:Wait()
 end
 
--- Settings
-local Developer = (isfile and (isfile("yeku.txt") and isfile("Legacy.rbxm")))
-local Environment = (getgenv or function() return _G end)
-local Settings = Environment().LegacySettings or ({
-	Year = 2012,
-	OldGraphics = true,
-	HideDisplayName = true,
-	SafeChat = true,
-	OldConsole = true,
-	OldBubbleChat = true,
-})
+--==================================================
+-- SETTINGS
+--==================================================
 
--- Services
+local Developer = isfile and isfile("yeku.txt")
+    and isfile("Legacy.rbxm")
+
+local Environment = getgenv or function()
+    return _G
+end
+
+local Settings = Environment().LegacySettings or {
+    Year = 2012,
+    OldGraphics = true,
+    HideDisplayName = true,
+    SafeChat = true,
+    OldConsole = true,
+    OldBubbleChat = true,
+}
+
+-- Smooth effects
+local Effects = {
+    CursorEnabled = true,
+    CursorSmoothness = 26,
+    CursorSize = 8,
+    TrailCount = 5,
+    TrailTransparency = 0.55,
+
+    SmoothScrolling = true,
+    ScrollSmoothness = 18,
+    ScrollSpeed = 44,
+
+    BlurOnScroll = true,
+    ScrollBlurSize = 3,
+    BlurFadeSpeed = 12,
+}
+
+--==================================================
+-- SERVICES
+--==================================================
+
 local Players = game:GetService("Players")
 local CoreGui = game:GetService("CoreGui")
 local StarterGui = game:GetService("StarterGui")
 local Lighting = game:GetService("Lighting")
 local TextChatService = game:GetService("TextChatService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 
--- Variables
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+--==================================================
+-- ORIGINAL LEGACY HELPERS
+--==================================================
+
+local function Force(Object, Property, Value)
+    if not Object then
+        return
+    end
+
+    pcall(function()
+        if Object[Property] ~= Value then
+            Object[Property] = Value
+        end
+
+        Object:GetPropertyChangedSignal(Property):Connect(function()
+            if Object.Parent and Object[Property] ~= Value then
+                Object[Property] = Value
+            end
+        end)
+    end)
+end
+
+local function Set(Object, Properties, Forced)
+    if not Object then
+        return
+    end
+
+    for Property, Value in pairs(Properties) do
+        local Success, Result = pcall(function()
+            Object[Property] = Value
+
+            if Forced then
+                Force(Object, Property, Value)
+            end
+        end)
+
+        if not Success then
+            warn("[Legacy] " .. tostring(Result))
+        end
+    end
+end
+
+local function Create(ClassName, Properties, Forced, Parent)
+    local Object = Instance.new(ClassName)
+
+    Set(Object, Properties, Forced)
+
+    if Parent then
+        Object.Parent = Parent
+    end
+
+    return Object
+end
+
+local function Run(Enabled, Callback)
+    if Enabled then
+        task.spawn(Callback)
+    end
+end
+
+--==================================================
+-- LOAD LEGACY
+--==================================================
+
 local RobloxGui = CoreGui:WaitForChild("RobloxGui")
-local ChatBubbles = CoreGui:WaitForChild("ExperienceChat"):WaitForChild("bubbleChat")
 
--- Types
-export type Properties = { [string]: any }
+local ChatBubbles
+pcall(function()
+    ChatBubbles = CoreGui
+        :WaitForChild("ExperienceChat")
+        :WaitForChild("bubbleChat")
+end)
 
--- Functions
-local Force = function(Object: Instance, Property: string, Value: any)
-	if (Object[Property] ~= Value) then
-		Object[Property] = Value
-	end
+local Suite = Environment().Suite
 
-	Object:GetPropertyChangedSignal(Property):Connect(function()
-		if (Object[Property] ~= Value) then
-			Object[Property] = Value
-		end
-	end)
+if not Suite then
+    Suite = loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/sigma393939/Flashbang-script/refs/heads/main/rbxmsuit"
+    ))()
 end
 
-local Set = function(Object: Instance, Properties: Properties, Forced: boolean)
-	if (not Object) then
-		return
-	end
+local Path
 
-	for Property, Value in next, Properties do
-		local Success, Result = pcall(function()
-			Object[Property] = Value
+if Developer then
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Legacy",
+            Text = "Running the developer build",
+            Duration = 5,
+        })
+    end)
 
-			if (Forced) then
-				Force(Object, Property, Value)
-			end
-		end)
-
-		if (not Success) then
-			warn(`{Result} | {debug.traceback()}`)
-		end
-	end
+    Path = "Legacy.rbxm"
+else
+    Path = Suite.download("yeku/legacy@latest", "Legacy.rbxm")
 end
 
-local Create = function(ClassName: string, Properties: Properties, Forced: boolean, Parent: Instance?)
-	local Object = Instance.new(ClassName)
+local Legacy = Suite.launch(Path, {
+    runscripts = true,
+    debug = true,
+})
 
-	if (Parent) then
-		Object.Parent = Parent
-	end
-
-	Set(Object, Properties, Forced)
-
-	return Object
-end
-
-local Run = function(Bool: boolean, Callback: () -> ())
-	if (Bool) then
-		task.spawn(Callback)
-	end
-end
-
--- Module
-local Suite = Environment().Suite or loadstring(game:HttpGet("https://raw.githubusercontent.com/yeku/forks/refs/heads/main/Scripts/RBXMSuite.luau"))()
-local Legacy = (function()
-	local Path do
-		if (Developer) then
-			StarterGui:SetCore("SendNotification", { Title = "Legacy", Text = "Running the developer build", Duration = 5 })
-			Path = "Legacy.rbxm"
-		else
-			local RBXM = Suite.download("yeku/legacy@latest", "Legacy.rbxm")
-			Path = RBXM
-		end
-	end
-
-	return Suite.launch(Path, { runscripts = true, debug = true })
-end)()
-
--- Setup
-local LegacyGui = Suite.require(Legacy):Start(Settings.Year, Settings.SafeChat)
+local LegacyGui = Suite.require(Legacy):Start(
+    Settings.Year,
+    Settings.SafeChat
+)
 
 RobloxGui.Enabled = false
-RobloxGui.NotificationFrame.Parent = LegacyGui
+
+pcall(function()
+    RobloxGui.NotificationFrame.Parent = LegacyGui
+end)
+
+--==================================================
+-- LEGACY CONSOLE
+--==================================================
 
 Run(Settings.OldConsole == true, function()
-	loadstring(game:HttpGet("https://raw.githubusercontent.com/yeku/forks/refs/heads/main/Scripts/LegacyConsole.luau"))()
+    loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/sigma393939/Flashbang-script/refs/heads/main/legacyconsole"
+    ))()
 end)
+
+--==================================================
+-- OLD GRAPHICS
+--==================================================
 
 Run(Settings.OldGraphics == true, function()
-	if (sethiddenproperty) then
-		task.spawn(sethiddenproperty, Lighting, "Technology", Enum.Technology.Compatibility)
-	end
+    if sethiddenproperty then
+        pcall(function()
+            sethiddenproperty(
+                Lighting,
+                "Technology",
+                Enum.Technology.Compatibility
+            )
+        end)
+    end
 
-	for _, Hidden in next, Lighting:QueryDescendants("> DepthOfFieldEffect, > SunRaysEffect, > BloomEffect, > BlurEffect, > ColorCorrectionEffect, > Atmosphere") do
-		if (Hidden:IsA("Atmosphere")) then
-			Hidden:Destroy()
-		else
-			Force(Hidden, "Enabled", false)
-		end
-	end
+    for _, Object in ipairs(Lighting:GetDescendants()) do
+        if Object:IsA("DepthOfFieldEffect")
+            or Object:IsA("SunRaysEffect")
+            or Object:IsA("BloomEffect")
+            or Object:IsA("BlurEffect")
+            or Object:IsA("ColorCorrectionEffect")
+            or Object:IsA("Atmosphere") then
 
-	Create("ColorGradingEffect", { TonemapperPreset = Enum.TonemapperPreset.Retro })
-	Create("ColorCorrectionEffect", {
-		Saturation = 0,
-		Contrast = -0.1,
-		Parent = Lighting,
-	})
+            if Object:IsA("Atmosphere") then
+                Object:Destroy()
+            else
+                Force(Object, "Enabled", false)
+            end
+        end
+    end
+
+    pcall(function()
+        Create("ColorGradingEffect", {
+            TonemapperPreset = Enum.TonemapperPreset.Retro,
+        }, false, Lighting)
+    end)
+
+    Create("ColorCorrectionEffect", {
+        Saturation = 0,
+        Contrast = -0.1,
+    }, false, Lighting)
 end)
+
+--==================================================
+-- OLD BUBBLE CHAT
+--==================================================
 
 Run(Settings.OldBubbleChat == true, function()
-	-- Variables
-	local BubbleChatConfiguration = TextChatService:WaitForChild("BubbleChatConfiguration")
-	local SourceSans = Font.fromEnum(Enum.Font.SourceSans)
-	local Size = UDim2.fromOffset(46, 35)
-	local PaddingData = ({ 
-		PaddingBottom = UDim.new(0, 4),
-		PaddingTop = UDim.new(0, 4),
-		PaddingLeft = UDim.new(0, 6),
-		PaddingRight = UDim.new(0, 6),
-	})
+    if not ChatBubbles then
+        return
+    end
 
-	-- Functions
-	local ConvertTail = function(Tail)
-		if (Tail) then
-			Set(Tail, {
-				Size = UDim2.fromOffset(25, 10),
-				ImageTransparency = 0,
-				Image = "rbxassetid://89395716827984"
-			})
-		end
-	end
+    local BubbleChatConfiguration =
+        TextChatService:WaitForChild("BubbleChatConfiguration")
 
-	local ConvertDistantBubble = function(DistantBubble)
-		local RoundedFrame = (DistantBubble and DistantBubble:FindFirstChild("RoundedFrame"))
-		local Corner = (RoundedFrame and RoundedFrame:FindFirstChildOfClass("UICorner"))
-		local Contents = (RoundedFrame and RoundedFrame:FindFirstChild("Contents"))
-		local Padding = (Contents and Contents:FindFirstChildOfClass("UIPadding"))
-		local Ellipsis = (Contents and Contents:FindFirstChildOfClass("TextLabel"))
+    local SourceSans = Font.fromEnum(Enum.Font.SourceSans)
+    local BubbleSize = UDim2.fromOffset(46, 35)
 
-		ConvertTail(DistantBubble:FindFirstChild("Carat"))
-		Set(DistantBubble, { Size = Size }, true)
-		Set(RoundedFrame, { Size = Size }, true)
-		Set(Contents, { Size = Size }, true)
-		Set(Corner, { CornerRadius = UDim.new(0, 5) })
-		Set(Padding, PaddingData)
-		Set(Ellipsis, {
-			FontFace = SourceSans,
-			TextSize = 22,
-			TextColor3 = Color3.fromRGB(60, 68, 75),
-			TextTransparency = 0,
-		}, true)
-	end
+    local PaddingData = {
+        PaddingBottom = UDim.new(0, 4),
+        PaddingTop = UDim.new(0, 4),
+        PaddingLeft = UDim.new(0, 6),
+        PaddingRight = UDim.new(0, 6),
+    }
 
-	local Convert = function(Object: Instance)
-		if (Object.Name == "Caret") then
-			ConvertTail(Object)
-		elseif (Object.Name == "DistantBubble") then
-			ConvertDistantBubble(Object)
-		end
-	end
+    local function ConvertTail(Tail)
+        if Tail then
+            Set(Tail, {
+                Size = UDim2.fromOffset(25, 10),
+                ImageTransparency = 0,
+                Image = "rbxassetid://89395716827984",
+            })
+        end
+    end
 
-	-- Setup
-	Set(BubbleChatConfiguration, {
-		FontFace = SourceSans,
-		TextSize = 22,
-		TextColor3 = Color3.fromRGB(60, 68, 75),
-		BackgroundTransparency = 0,
-		LocalPlayerStudsOffset = Vector3.new(0, 0.4, 0),
-	}, true)
+    local function ConvertDistantBubble(Bubble)
+        local RoundedFrame = Bubble:FindFirstChild("RoundedFrame")
+        local Corner = RoundedFrame
+            and RoundedFrame:FindFirstChildOfClass("UICorner")
 
-	Create("UICorner", { Parent = BubbleChatConfiguration, CornerRadius = UDim.new(0, 5) })
-	Create("UIPadding", PaddingData, false, BubbleChatConfiguration)
+        local Contents = RoundedFrame
+            and RoundedFrame:FindFirstChild("Contents")
 
-	for _, Object in next, ChatBubbles:QueryDescendants(`#Caret, #DistantBubble`) do
-		Convert(Object)
-	end
+        local Padding = Contents
+            and Contents:FindFirstChildOfClass("UIPadding")
 
-	ChatBubbles.DescendantAdded:Connect(Convert)
+        local Ellipsis = Contents
+            and Contents:FindFirstChildOfClass("TextLabel")
+
+        ConvertTail(Bubble:FindFirstChild("Carat"))
+
+        Set(Bubble, { Size = BubbleSize }, true)
+        Set(RoundedFrame, { Size = BubbleSize }, true)
+        Set(Contents, { Size = BubbleSize }, true)
+        Set(Corner, { CornerRadius = UDim.new(0, 5) })
+        Set(Padding, PaddingData)
+
+        Set(Ellipsis, {
+            FontFace = SourceSans,
+            TextSize = 22,
+            TextColor3 = Color3.fromRGB(60, 68, 75),
+            TextTransparency = 0,
+        }, true)
+    end
+
+    local function Convert(Object)
+        if Object.Name == "Caret" then
+            ConvertTail(Object)
+        elseif Object.Name == "DistantBubble" then
+            ConvertDistantBubble(Object)
+        end
+    end
+
+    Set(BubbleChatConfiguration, {
+        FontFace = SourceSans,
+        TextSize = 22,
+        TextColor3 = Color3.fromRGB(60, 68, 75),
+        BackgroundTransparency = 0,
+        LocalPlayerStudsOffset = Vector3.new(0, 0.4, 0),
+    }, true)
+
+    Create("UICorner", {
+        CornerRadius = UDim.new(0, 5),
+    }, false, BubbleChatConfiguration)
+
+    Create("UIPadding", PaddingData, false, BubbleChatConfiguration)
+
+    for _, Object in ipairs(ChatBubbles:GetDescendants()) do
+        Convert(Object)
+    end
+
+    ChatBubbles.DescendantAdded:Connect(Convert)
 end)
 
-Run(Settings.HideDisplayName, function()
-	-- Functions
-	local Change = function(Player)
-		local Character = (Player.Character or Player.CharacterAdded:Wait())
-		local Humanoid = (Character and Character:FindFirstChildOfClass("Humanoid"))
+--==================================================
+-- HIDE DISPLAY NAMES
+--==================================================
 
-		if (Humanoid and Humanoid.DisplayName == Player.DisplayName) then
-			Humanoid.DisplayName = Player.Name
-		else
-			Character.ChildAdded:Connect(function(Humanoid)
-				if (Humanoid:IsA("Humanoid") and Humanoid.DisplayName == Player.DisplayName) then
-					Humanoid.DisplayName = Player.Name
-				end
-			end)
-		end
-	end
+Run(Settings.HideDisplayName == true, function()
+    local function Change(PlayerObject)
+        local Character = PlayerObject.Character
+            or PlayerObject.CharacterAdded:Wait()
 
-	local Joined = function(Player)
-		Change(Player)
-		Player.CharacterAdded:Connect(function()
-			Change(Player)
-		end)
-	end
+        local Humanoid = Character:FindFirstChildOfClass("Humanoid")
 
-	-- Setup
-	for _, Player in next, Players:GetPlayers() do
-		task.spawn(Joined, Player)
-	end
+        if Humanoid and Humanoid.DisplayName == PlayerObject.DisplayName then
+            Humanoid.DisplayName = PlayerObject.Name
+        end
 
-	Players.PlayerAdded:Connect(Joined)
+        Character.ChildAdded:Connect(function(Object)
+            if Object:IsA("Humanoid")
+                and Object.DisplayName == PlayerObject.DisplayName then
+
+                Object.DisplayName = PlayerObject.Name
+            end
+        end)
+    end
+
+    local function Joined(PlayerObject)
+        task.spawn(Change, PlayerObject)
+
+        PlayerObject.CharacterAdded:Connect(function()
+            task.spawn(Change, PlayerObject)
+        end)
+    end
+
+    for _, PlayerObject in ipairs(Players:GetPlayers()) do
+        Joined(PlayerObject)
+    end
+
+    Players.PlayerAdded:Connect(Joined)
+end)
+
+--==================================================
+-- HIDE MODERN TOP BAR AND CONTROL FRAME
+--==================================================
+
+task.spawn(function()
+    local TopBar = CoreGui:WaitForChild("TopBarApp", 10)
+
+    if TopBar then
+        local Inner = TopBar:FindFirstChild("TopBarApp")
+
+        if Inner then
+            Force(Inner, "Enabled", false)
+        end
+    end
 end)
 
 task.spawn(function()
-	local TopBarApp = CoreGui:WaitForChild("TopBarApp", 10):WaitForChild("TopBarApp", 10)
-	Force(TopBarApp, "Enabled", false)
+    local Shield = RobloxGui:WaitForChild("SettingsClippingShield", 10)
+
+    if Shield then
+        local SettingsShield = Shield:FindFirstChild("SettingsShield")
+        local Modal = SettingsShield and SettingsShield:FindFirstChild("Modal")
+
+        if Modal then
+            Set(Modal, {
+                Visible = false,
+                Modal = false,
+            }, true)
+        end
+    end
 end)
 
 task.spawn(function()
-	local SettingsShield = RobloxGui:WaitForChild("SettingsClippingShield"):WaitForChild("SettingsShield")
-	local Modal = (SettingsShield and SettingsShield:WaitForChild("Modal"))
+    local ControlFrame = RobloxGui:WaitForChild("ControlFrame", 10)
 
-	if (Modal) then
-		Set(Modal, {
-			Visible = false,
-			Modal = false,
-		}, true)
-	end
+    if ControlFrame then
+        ControlFrame:Destroy()
+    end
 end)
 
-task.spawn(function()
-	local ControlFrame = RobloxGui:WaitForChild("ControlFrame", 10)
+--==================================================
+-- SMOOTH CURSOR + MOTION TRAIL
+--==================================================
 
-	if (ControlFrame) then
-		ControlFrame:Destroy()
-	end
+local OldCursor = PlayerGui:FindFirstChild("LegacySmoothEffects")
+
+if OldCursor then
+    OldCursor:Destroy()
+end
+
+local EffectsGui = Create("ScreenGui", {
+    Name = "LegacySmoothEffects",
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    DisplayOrder = 100000,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, false, PlayerGui)
+
+local Cursor
+local TrailItems = {}
+
+if Effects.CursorEnabled then
+    for Index = Effects.TrailCount, 1, -1 do
+        local Dot = Create("Frame", {
+            Name = "CursorTrail" .. Index,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Size = UDim2.fromOffset(
+                math.max(2, Effects.CursorSize - Index),
+                math.max(2, Effects.CursorSize - Index)
+            ),
+            BackgroundColor3 = Color3.fromRGB(205, 220, 255),
+            BackgroundTransparency = math.clamp(
+                Effects.TrailTransparency + Index * 0.06,
+                0,
+                0.95
+            ),
+            BorderSizePixel = 0,
+            ZIndex = 10,
+        }, false, EffectsGui)
+
+        Create("UICorner", {
+            CornerRadius = UDim.new(1, 0),
+        }, false, Dot)
+
+        table.insert(TrailItems, {
+            Object = Dot,
+            Position = Vector2.zero,
+        })
+    end
+
+    Cursor = Create("Frame", {
+        Name = "SmoothCursor",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(
+            Effects.CursorSize,
+            Effects.CursorSize
+        ),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        ZIndex = 20,
+    }, false, EffectsGui)
+
+    Create("UICorner", {
+        CornerRadius = UDim.new(1, 0),
+    }, false, Cursor)
+
+    Create("UIStroke", {
+        Color = Color3.fromRGB(35, 35, 35),
+        Thickness = 1,
+    }, false, Cursor)
+
+    UserInputService.MouseIconEnabled = false
+end
+
+--==================================================
+-- SMOOTH SCROLLING
+--==================================================
+
+local ScrollTargets = {}
+local ScrollConnections = {}
+local ScrollBlurAmount = 0
+
+-- Blur the 3D scene subtly while scrolling.
+-- This does not blur the UI itself.
+local ScrollBlur = Create("BlurEffect", {
+    Name = "LegacyScrollBlur",
+    Size = 0,
+    Enabled = true,
+}, false, Lighting)
+
+local function RegisterScrollingFrame(Frame)
+    if not Frame:IsA("ScrollingFrame") then
+        return
+    end
+
+    if ScrollTargets[Frame] then
+        return
+    end
+
+    ScrollTargets[Frame] = {
+        Position = Frame.CanvasPosition,
+        Target = Frame.CanvasPosition,
+        LastInput = 0,
+    }
+
+    -- Keep this frame registered if the UI is moved around.
+    local Connection = Frame.AncestryChanged:Connect(function()
+        if not Frame:IsDescendantOf(game) then
+            ScrollTargets[Frame] = nil
+
+            if ScrollConnections[Frame] then
+                ScrollConnections[Frame]:Disconnect()
+                ScrollConnections[Frame] = nil
+            end
+        end
+    end)
+
+    ScrollConnections[Frame] = Connection
+end
+
+local function RegisterExistingFrames(Root)
+    for _, Object in ipairs(Root:GetDescendants()) do
+        if Object:IsA("ScrollingFrame") then
+            RegisterScrollingFrame(Object)
+        end
+    end
+
+    Root.DescendantAdded:Connect(function(Object)
+        if Object:IsA("ScrollingFrame") then
+            RegisterScrollingFrame(Object)
+        end
+    end)
+end
+
+RegisterExistingFrames(PlayerGui)
+
+pcall(function()
+    RegisterExistingFrames(LegacyGui)
 end)
+
+-- Find the topmost scrolling frame under the mouse.
+local function FindScrollFrame(Position)
+    local Objects = PlayerGui:GetGuiObjectsAtPosition(
+        math.floor(Position.X),
+        math.floor(Position.Y)
+    )
+
+    for Index = #Objects, 1, -1 do
+        local Object = Objects[Index]
+        local Parent = Object
+
+        while Parent and Parent ~= PlayerGui do
+            if Parent:IsA("ScrollingFrame")
+                and ScrollTargets[Parent]
+                and Parent.Visible then
+
+                return Parent
+            end
+
+            Parent = Parent.Parent
+        end
+    end
+
+    return nil
+end
+
+UserInputService.InputChanged:Connect(function(Input, Processed)
+    if not Effects.SmoothScrolling or Processed then
+        return
+    end
+
+    if Input.UserInputType ~= Enum.UserInputType.MouseWheel then
+        return
+    end
+
+    local MousePosition = UserInputService:GetMouseLocation()
+    local Frame = FindScrollFrame(MousePosition)
+
+    if not Frame then
+        return
+    end
+
+    local Data = ScrollTargets[Frame]
+
+    if not Data then
+        return
+    end
+
+    -- Cancel the native wheel delta and apply our own eased target.
+    -- The target is clamped to the actual canvas bounds.
+    local Delta = Input.Position.Z * Effects.ScrollSpeed
+
+    local CanvasSize = Frame.AbsoluteCanvasSize
+    local ViewSize = Frame.AbsoluteWindowSize
+
+    local MaxX = math.max(0, CanvasSize.X - ViewSize.X)
+    local MaxY = math.max(0, CanvasSize.Y - ViewSize.Y)
+
+    Data.Target = Vector2.new(
+        math.clamp(Data.Target.X - Delta, 0, MaxX),
+        math.clamp(Data.Target.Y - Delta, 0, MaxY)
+    )
+
+    Data.LastInput = os.clock()
+    ScrollBlurAmount = Effects.ScrollBlurSize
+end)
+
+--==================================================
+-- SMOOTH ANIMATION LOOP
+--==================================================
+
+local CurrentMouse = UserInputService:GetMouseLocation()
+local CursorPosition = Vector2.new(CurrentMouse.X, CurrentMouse.Y)
+
+for _, Item in ipairs(TrailItems) do
+    Item.Position = CursorPosition
+end
+
+local RenderConnection
+
+RenderConnection = RunService.RenderStepped:Connect(function(DeltaTime)
+    local Mouse = UserInputService:GetMouseLocation()
+    local Target = Vector2.new(Mouse.X, Mouse.Y)
+
+    -- Cursor interpolation
+    if Cursor and Cursor.Parent then
+        local Alpha = 1 - math.exp(
+            -Effects.CursorSmoothness * DeltaTime
+        )
+
+        CursorPosition = CursorPosition:Lerp(Target, Alpha)
+
+        Cursor.Position = UDim2.fromOffset(
+            CursorPosition.X,
+            CursorPosition.Y
+        )
+
+        local Previous = CursorPosition
+
+        for _, Item in ipairs(TrailItems) do
+            local TrailAlpha = 1 - math.exp(
+                -Effects.CursorSmoothness * 0.75 * DeltaTime
+            )
+
+            Item.Position = Item.Position:Lerp(
+                Previous,
+                TrailAlpha
+            )
+
+            Item.Object.Position = UDim2.fromOffset(
+                Item.Position.X,
+                Item.Position.Y
+            )
+
+            Previous = Item.Position
+        end
+    end
+
+    -- Smooth scrolling interpolation
+    for Frame, Data in pairs(ScrollTargets) do
+        if not Frame.Parent then
+            ScrollTargets[Frame] = nil
+        else
+            local Alpha = 1 - math.exp(
+                -Effects.ScrollSmoothness * DeltaTime
+            )
+
+            Data.Position = Data.Position:Lerp(Data.Target, Alpha)
+
+            -- Prevent endless subpixel movement.
+            if (Data.Position - Data.Target).Magnitude < 0.1 then
+                Data.Position = Data.Target
+            end
+
+            if (Frame.CanvasPosition - Data.Position).Magnitude > 0.05 then
+                Frame.CanvasPosition = Data.Position
+            end
+        end
+    end
+
+    -- Fade scene blur in and out
+    local BlurAlpha = 1 - math.exp(
+        -Effects.BlurFadeSpeed * DeltaTime
+    )
+
+    if os.clock() - (ScrollBlur.LastInput or 0) > 0.12 then
+        ScrollBlurAmount = ScrollBlurAmount
+            * math.exp(-Effects.BlurFadeSpeed * DeltaTime)
+    end
+
+    ScrollBlur.Size = ScrollBlur.Size
+        + (ScrollBlurAmount - ScrollBlur.Size) * BlurAlpha
+end)
+
+--==================================================
+-- CLEANUP
+--==================================================
+
+EffectsGui.Destroying:Connect(function()
+    if RenderConnection then
+        RenderConnection:Disconnect()
+    end
+
+    UserInputService.MouseIconEnabled = true
+
+    if ScrollBlur then
+        ScrollBlur:Destroy()
+    end
+
+    for _, Connection in pairs(ScrollConnections) do
+        Connection:Disconnect()
+    end
+end)
+
+print("[Legacy] Smooth cursor and UI effects initialized.")
