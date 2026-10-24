@@ -1,12 +1,18 @@
 
 --[[
-    LEGACY + SMOOTH UI EFFECTS
-    Original Legacy setup with smooth cursor, scrolling and UI transitions.
+ ___       _______   ________  ________  ________      ___    ___
+|\  \     |\  ___ \ |\   ____\|\   __  \|\   ____\    |\  \  /  /|
+\ \  \    \ \   __/|\ \  \___|\ \  \|\  \ \  \___|    \ \  \/  / /
+ \ \  \    \ \  \_|/_\ \  \  __\ \   __  \ \  \        \ \    / /
+  \ \  \____\ \  \_|\ \ \  \|\  \ \  \ \  \ \  \____    \/   / /
+   \ \_______\ \_______\ \_______\ \__\ \__\ \_______\__/   / /
+    \|_______|\|_______|\|_______|\|__|\|__|\|_______|\____/ /
+                                                     \|____|/
 
-    Note:
-    - Cursor trails simulate motion blur.
-    - BlurEffect affects the 3D scene, not ScreenGui elements.
-    - Smooth scrolling is applied to mouse-wheel scrolling frames.
+    LEGACY + CURSOR MOTION BLUR
+    PC: Original Roblox arrow + arrow-shaped motion trail
+    Gamepad: Smooth dot cursor
+    Includes eased scrolling and subtle scene blur
 ]]
 
 if not game:IsLoaded() then
@@ -16,9 +22,6 @@ end
 --==================================================
 -- SETTINGS
 --==================================================
-
-local Developer = isfile and isfile("yeku.txt")
-    and isfile("Legacy.rbxm")
 
 local Environment = getgenv or function()
     return _G
@@ -33,21 +36,28 @@ local Settings = Environment().LegacySettings or {
     OldBubbleChat = true,
 }
 
--- Smooth effects
 local Effects = {
-    CursorEnabled = true,
-    CursorSmoothness = 26,
-    CursorSize = 8,
-    TrailCount = 5,
-    TrailTransparency = 0.55,
+    -- Cursor motion blur
+    TrailEnabled = true,
+    TrailCount = 8,
+    TrailSampleRate = 1, -- Every rendered frame
+    TrailFadeSpeed = 1,
+    TrailOpacity = 0.76,
+    TrailScale = 1,
 
+    -- Cursor mode
+    GamepadDotEnabled = true,
+    DotSize = 7,
+
+    -- Scrolling
     SmoothScrolling = true,
-    ScrollSmoothness = 18,
-    ScrollSpeed = 44,
+    ScrollSmoothness = 22,
+    ScrollSpeed = 48,
 
-    BlurOnScroll = true,
-    ScrollBlurSize = 3,
-    BlurFadeSpeed = 12,
+    -- Scene blur during scrolling
+    ScrollBlurEnabled = true,
+    ScrollBlurMax = 2,
+    ScrollBlurFadeSpeed = 15,
 }
 
 --==================================================
@@ -67,7 +77,7 @@ local Player = Players.LocalPlayer
 local PlayerGui = Player:WaitForChild("PlayerGui")
 
 --==================================================
--- ORIGINAL LEGACY HELPERS
+-- HELPERS
 --==================================================
 
 local function Force(Object, Property, Value)
@@ -94,17 +104,13 @@ local function Set(Object, Properties, Forced)
     end
 
     for Property, Value in pairs(Properties) do
-        local Success, Result = pcall(function()
+        pcall(function()
             Object[Property] = Value
 
             if Forced then
                 Force(Object, Property, Value)
             end
         end)
-
-        if not Success then
-            warn("[Legacy] " .. tostring(Result))
-        end
     end
 end
 
@@ -127,12 +133,21 @@ local function Run(Enabled, Callback)
 end
 
 --==================================================
--- LOAD LEGACY
+-- LEGACY LOADER
 --==================================================
+
+local Developer = false
+
+pcall(function()
+    Developer = isfile
+        and isfile("yeku.txt")
+        and isfile("Legacy.rbxm")
+end)
 
 local RobloxGui = CoreGui:WaitForChild("RobloxGui")
 
 local ChatBubbles
+
 pcall(function()
     ChatBubbles = CoreGui
         :WaitForChild("ExperienceChat")
@@ -180,7 +195,7 @@ pcall(function()
 end)
 
 --==================================================
--- LEGACY CONSOLE
+-- OLD CONSOLE
 --==================================================
 
 Run(Settings.OldConsole == true, function()
@@ -205,18 +220,15 @@ Run(Settings.OldGraphics == true, function()
     end
 
     for _, Object in ipairs(Lighting:GetDescendants()) do
-        if Object:IsA("DepthOfFieldEffect")
+        if Object:IsA("Atmosphere") then
+            Object:Destroy()
+        elseif Object:IsA("DepthOfFieldEffect")
             or Object:IsA("SunRaysEffect")
             or Object:IsA("BloomEffect")
             or Object:IsA("BlurEffect")
-            or Object:IsA("ColorCorrectionEffect")
-            or Object:IsA("Atmosphere") then
+            or Object:IsA("ColorCorrectionEffect") then
 
-            if Object:IsA("Atmosphere") then
-                Object:Destroy()
-            else
-                Force(Object, "Enabled", false)
-            end
+            Object.Enabled = false
         end
     end
 
@@ -241,11 +253,10 @@ Run(Settings.OldBubbleChat == true, function()
         return
     end
 
-    local BubbleChatConfiguration =
+    local Configuration =
         TextChatService:WaitForChild("BubbleChatConfiguration")
 
     local SourceSans = Font.fromEnum(Enum.Font.SourceSans)
-    local BubbleSize = UDim2.fromOffset(46, 35)
 
     local PaddingData = {
         PaddingBottom = UDim.new(0, 4),
@@ -264,29 +275,40 @@ Run(Settings.OldBubbleChat == true, function()
         end
     end
 
-    local function ConvertDistantBubble(Bubble)
-        local RoundedFrame = Bubble:FindFirstChild("RoundedFrame")
-        local Corner = RoundedFrame
-            and RoundedFrame:FindFirstChildOfClass("UICorner")
+    local function ConvertBubble(Bubble)
+        local Rounded = Bubble:FindFirstChild("RoundedFrame")
+        local Contents = Rounded and Rounded:FindFirstChild("Contents")
 
-        local Contents = RoundedFrame
-            and RoundedFrame:FindFirstChild("Contents")
+        local Corner = Rounded
+            and Rounded:FindFirstChildOfClass("UICorner")
 
         local Padding = Contents
             and Contents:FindFirstChildOfClass("UIPadding")
 
-        local Ellipsis = Contents
+        local Label = Contents
             and Contents:FindFirstChildOfClass("TextLabel")
 
         ConvertTail(Bubble:FindFirstChild("Carat"))
 
-        Set(Bubble, { Size = BubbleSize }, true)
-        Set(RoundedFrame, { Size = BubbleSize }, true)
-        Set(Contents, { Size = BubbleSize }, true)
-        Set(Corner, { CornerRadius = UDim.new(0, 5) })
+        Set(Bubble, {
+            Size = UDim2.fromOffset(46, 35),
+        }, true)
+
+        Set(Rounded, {
+            Size = UDim2.fromOffset(46, 35),
+        }, true)
+
+        Set(Contents, {
+            Size = UDim2.fromOffset(46, 35),
+        }, true)
+
+        Set(Corner, {
+            CornerRadius = UDim.new(0, 5),
+        })
+
         Set(Padding, PaddingData)
 
-        Set(Ellipsis, {
+        Set(Label, {
             FontFace = SourceSans,
             TextSize = 22,
             TextColor3 = Color3.fromRGB(60, 68, 75),
@@ -298,11 +320,11 @@ Run(Settings.OldBubbleChat == true, function()
         if Object.Name == "Caret" then
             ConvertTail(Object)
         elseif Object.Name == "DistantBubble" then
-            ConvertDistantBubble(Object)
+            ConvertBubble(Object)
         end
     end
 
-    Set(BubbleChatConfiguration, {
+    Set(Configuration, {
         FontFace = SourceSans,
         TextSize = 22,
         TextColor3 = Color3.fromRGB(60, 68, 75),
@@ -312,9 +334,9 @@ Run(Settings.OldBubbleChat == true, function()
 
     Create("UICorner", {
         CornerRadius = UDim.new(0, 5),
-    }, false, BubbleChatConfiguration)
+    }, false, Configuration)
 
-    Create("UIPadding", PaddingData, false, BubbleChatConfiguration)
+    Create("UIPadding", PaddingData, false, Configuration)
 
     for _, Object in ipairs(ChatBubbles:GetDescendants()) do
         Convert(Object)
@@ -334,7 +356,9 @@ Run(Settings.HideDisplayName == true, function()
 
         local Humanoid = Character:FindFirstChildOfClass("Humanoid")
 
-        if Humanoid and Humanoid.DisplayName == PlayerObject.DisplayName then
+        if Humanoid
+            and Humanoid.DisplayName == PlayerObject.DisplayName then
+
             Humanoid.DisplayName = PlayerObject.Name
         end
 
@@ -363,7 +387,7 @@ Run(Settings.HideDisplayName == true, function()
 end)
 
 --==================================================
--- HIDE MODERN TOP BAR AND CONTROL FRAME
+-- REMOVE MODERN TOP BAR / CONTROLS
 --==================================================
 
 task.spawn(function()
@@ -379,11 +403,15 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local Shield = RobloxGui:WaitForChild("SettingsClippingShield", 10)
+    local Shield = RobloxGui:WaitForChild(
+        "SettingsClippingShield",
+        10
+    )
 
     if Shield then
         local SettingsShield = Shield:FindFirstChild("SettingsShield")
-        local Modal = SettingsShield and SettingsShield:FindFirstChild("Modal")
+        local Modal = SettingsShield
+            and SettingsShield:FindFirstChild("Modal")
 
         if Modal then
             Set(Modal, {
@@ -403,159 +431,178 @@ task.spawn(function()
 end)
 
 --==================================================
--- SMOOTH CURSOR + MOTION TRAIL
+-- CURSOR MOTION BLUR
 --==================================================
 
-local OldCursor = PlayerGui:FindFirstChild("LegacySmoothEffects")
+local PreviousEffects = PlayerGui:FindFirstChild(
+    "LegacyCursorMotionBlur"
+)
 
-if OldCursor then
-    OldCursor:Destroy()
+if PreviousEffects then
+    PreviousEffects:Destroy()
 end
 
 local EffectsGui = Create("ScreenGui", {
-    Name = "LegacySmoothEffects",
+    Name = "LegacyCursorMotionBlur",
     IgnoreGuiInset = true,
     ResetOnSpawn = false,
     DisplayOrder = 100000,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, false, PlayerGui)
 
-local Cursor
-local TrailItems = {}
+-- The native Roblox mouse cursor stays visible on PC.
+-- These images are additional fading copies behind it.
+local Trail = {}
+local TrailPositions = {}
+local TrailImages = {}
 
-if Effects.CursorEnabled then
-    for Index = Effects.TrailCount, 1, -1 do
-        local Dot = Create("Frame", {
-            Name = "CursorTrail" .. Index,
-            AnchorPoint = Vector2.new(0.5, 0.5),
-            Size = UDim2.fromOffset(
-                math.max(2, Effects.CursorSize - Index),
-                math.max(2, Effects.CursorSize - Index)
-            ),
-            BackgroundColor3 = Color3.fromRGB(205, 220, 255),
-            BackgroundTransparency = math.clamp(
-                Effects.TrailTransparency + Index * 0.06,
-                0,
-                0.95
-            ),
-            BorderSizePixel = 0,
-            ZIndex = 10,
-        }, false, EffectsGui)
+local ArrowImage = "rbxasset://textures/ArrowCursor.png"
 
-        Create("UICorner", {
-            CornerRadius = UDim.new(1, 0),
-        }, false, Dot)
-
-        table.insert(TrailItems, {
-            Object = Dot,
-            Position = Vector2.zero,
-        })
-    end
-
-    Cursor = Create("Frame", {
-        Name = "SmoothCursor",
-        AnchorPoint = Vector2.new(0.5, 0.5),
+local function CreateTrailImage(Index)
+    local Image = Create("ImageLabel", {
+        Name = "ArrowTrail" .. Index,
+        AnchorPoint = Vector2.new(0, 0),
+        Position = UDim2.fromOffset(-100, -100),
         Size = UDim2.fromOffset(
-            Effects.CursorSize,
-            Effects.CursorSize
+            24 * Effects.TrailScale,
+            24 * Effects.TrailScale
         ),
-        BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0,
-        ZIndex = 20,
+        BackgroundTransparency = 1,
+        Image = ArrowImage,
+        ImageColor3 = Color3.new(1, 1, 1),
+        ImageTransparency = 1,
+        ScaleType = Enum.ScaleType.Stretch,
+        ZIndex = Index,
     }, false, EffectsGui)
 
-    Create("UICorner", {
-        CornerRadius = UDim.new(1, 0),
-    }, false, Cursor)
+    TrailImages[Index] = Image
 
-    Create("UIStroke", {
-        Color = Color3.fromRGB(35, 35, 35),
-        Thickness = 1,
-    }, false, Cursor)
-
-    UserInputService.MouseIconEnabled = false
+    return Image
 end
+
+for Index = 1, Effects.TrailCount do
+    Trail[Index] = CreateTrailImage(Index)
+    TrailPositions[Index] = Vector2.new(-100, -100)
+end
+
+-- Gamepad-only dot. PC users never get this dot.
+local GamepadDot = Create("Frame", {
+    Name = "GamepadCursor",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(
+        Effects.DotSize,
+        Effects.DotSize
+    ),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 100,
+}, false, EffectsGui)
+
+Create("UICorner", {
+    CornerRadius = UDim.new(1, 0),
+}, false, GamepadDot)
+
+Create("UIStroke", {
+    Color = Color3.fromRGB(35, 35, 35),
+    Thickness = 1,
+}, false, GamepadDot)
+
+local LastInputType = UserInputService:GetLastInputType()
+local UsingGamepad = false
+
+local function IsGamepad(InputType)
+    return InputType == Enum.UserInputType.Gamepad1
+        or InputType == Enum.UserInputType.Gamepad2
+        or InputType == Enum.UserInputType.Gamepad3
+        or InputType == Enum.UserInputType.Gamepad4
+        or InputType == Enum.UserInputType.Gamepad5
+        or InputType == Enum.UserInputType.Gamepad6
+        or InputType == Enum.UserInputType.Gamepad7
+        or InputType == Enum.UserInputType.Gamepad8
+end
+
+local function UpdateInputMode(InputType)
+    if IsGamepad(InputType) then
+        UsingGamepad = true
+    elseif InputType == Enum.UserInputType.MouseMovement
+        or InputType == Enum.UserInputType.MouseButton1
+        or InputType == Enum.UserInputType.MouseButton2
+        or InputType == Enum.UserInputType.MouseButton3
+        or InputType == Enum.UserInputType.Touch then
+
+        UsingGamepad = false
+    end
+
+    GamepadDot.Visible =
+        Effects.GamepadDotEnabled and UsingGamepad
+end
+
+UserInputService.LastInputTypeChanged:Connect(UpdateInputMode)
+UpdateInputMode(LastInputType)
 
 --==================================================
 -- SMOOTH SCROLLING
 --==================================================
 
-local ScrollTargets = {}
-local ScrollConnections = {}
+local ScrollFrames = {}
 local ScrollBlurAmount = 0
 
--- Blur the 3D scene subtly while scrolling.
--- This does not blur the UI itself.
 local ScrollBlur = Create("BlurEffect", {
-    Name = "LegacyScrollBlur",
+    Name = "LegacyScrollSceneBlur",
     Size = 0,
-    Enabled = true,
+    Enabled = Effects.ScrollBlurEnabled,
 }, false, Lighting)
 
-local function RegisterScrollingFrame(Frame)
-    if not Frame:IsA("ScrollingFrame") then
+local function RegisterScrollFrame(Frame)
+    if not Frame:IsA("ScrollingFrame")
+        or ScrollFrames[Frame] then
+
         return
     end
 
-    if ScrollTargets[Frame] then
-        return
-    end
-
-    ScrollTargets[Frame] = {
-        Position = Frame.CanvasPosition,
+    ScrollFrames[Frame] = {
         Target = Frame.CanvasPosition,
-        LastInput = 0,
+        Current = Frame.CanvasPosition,
     }
-
-    -- Keep this frame registered if the UI is moved around.
-    local Connection = Frame.AncestryChanged:Connect(function()
-        if not Frame:IsDescendantOf(game) then
-            ScrollTargets[Frame] = nil
-
-            if ScrollConnections[Frame] then
-                ScrollConnections[Frame]:Disconnect()
-                ScrollConnections[Frame] = nil
-            end
-        end
-    end)
-
-    ScrollConnections[Frame] = Connection
 end
 
-local function RegisterExistingFrames(Root)
+local function RegisterRoot(Root)
     for _, Object in ipairs(Root:GetDescendants()) do
-        if Object:IsA("ScrollingFrame") then
-            RegisterScrollingFrame(Object)
-        end
+        RegisterScrollFrame(Object)
     end
 
-    Root.DescendantAdded:Connect(function(Object)
-        if Object:IsA("ScrollingFrame") then
-            RegisterScrollingFrame(Object)
-        end
-    end)
+    Root.DescendantAdded:Connect(RegisterScrollFrame)
 end
 
-RegisterExistingFrames(PlayerGui)
+RegisterRoot(PlayerGui)
 
 pcall(function()
-    RegisterExistingFrames(LegacyGui)
+    RegisterRoot(LegacyGui)
 end)
 
--- Find the topmost scrolling frame under the mouse.
-local function FindScrollFrame(Position)
-    local Objects = PlayerGui:GetGuiObjectsAtPosition(
-        math.floor(Position.X),
-        math.floor(Position.Y)
-    )
+local function GetScrollFrameAtMouse()
+    local Mouse = UserInputService:GetMouseLocation()
+
+    local Success, Objects = pcall(function()
+        return PlayerGui:GetGuiObjectsAtPosition(
+            math.floor(Mouse.X),
+            math.floor(Mouse.Y)
+        )
+    end)
+
+    if not Success then
+        return nil
+    end
 
     for Index = #Objects, 1, -1 do
         local Object = Objects[Index]
         local Parent = Object
 
-        while Parent and Parent ~= PlayerGui do
+        while Parent do
             if Parent:IsA("ScrollingFrame")
-                and ScrollTargets[Parent]
+                and ScrollFrames[Parent]
                 and Parent.Visible then
 
                 return Parent
@@ -577,123 +624,144 @@ UserInputService.InputChanged:Connect(function(Input, Processed)
         return
     end
 
-    local MousePosition = UserInputService:GetMouseLocation()
-    local Frame = FindScrollFrame(MousePosition)
+    local Frame = GetScrollFrameAtMouse()
 
     if not Frame then
         return
     end
 
-    local Data = ScrollTargets[Frame]
+    local Data = ScrollFrames[Frame]
 
     if not Data then
         return
     end
 
-    -- Cancel the native wheel delta and apply our own eased target.
-    -- The target is clamped to the actual canvas bounds.
+    local Canvas = Frame.AbsoluteCanvasSize
+    local Window = Frame.AbsoluteWindowSize
+
+    local MaxX = math.max(0, Canvas.X - Window.X)
+    local MaxY = math.max(0, Canvas.Y - Window.Y)
+
     local Delta = Input.Position.Z * Effects.ScrollSpeed
-
-    local CanvasSize = Frame.AbsoluteCanvasSize
-    local ViewSize = Frame.AbsoluteWindowSize
-
-    local MaxX = math.max(0, CanvasSize.X - ViewSize.X)
-    local MaxY = math.max(0, CanvasSize.Y - ViewSize.Y)
 
     Data.Target = Vector2.new(
         math.clamp(Data.Target.X - Delta, 0, MaxX),
         math.clamp(Data.Target.Y - Delta, 0, MaxY)
     )
 
-    Data.LastInput = os.clock()
-    ScrollBlurAmount = Effects.ScrollBlurSize
+    ScrollBlurAmount = Effects.ScrollBlurMax
 end)
 
 --==================================================
--- SMOOTH ANIMATION LOOP
+-- RENDER LOOP
 --==================================================
 
-local CurrentMouse = UserInputService:GetMouseLocation()
-local CursorPosition = Vector2.new(CurrentMouse.X, CurrentMouse.Y)
+local FrameCounter = 0
+local MousePosition = UserInputService:GetMouseLocation()
 
-for _, Item in ipairs(TrailItems) do
-    Item.Position = CursorPosition
+for Index = 1, #TrailPositions do
+    TrailPositions[Index] = Vector2.new(
+        MousePosition.X,
+        MousePosition.Y
+    )
 end
 
 local RenderConnection
 
 RenderConnection = RunService.RenderStepped:Connect(function(DeltaTime)
+    FrameCounter += 1
+
     local Mouse = UserInputService:GetMouseLocation()
-    local Target = Vector2.new(Mouse.X, Mouse.Y)
+    local Position = Vector2.new(Mouse.X, Mouse.Y)
 
-    -- Cursor interpolation
-    if Cursor and Cursor.Parent then
-        local Alpha = 1 - math.exp(
-            -Effects.CursorSmoothness * DeltaTime
+    -- Native mouse stays enabled for PC.
+    -- The gamepad dot appears only when the last input was gamepad.
+    if UsingGamepad then
+        GamepadDot.Position = UDim2.fromOffset(
+            Position.X,
+            Position.Y
         )
+    end
 
-        CursorPosition = CursorPosition:Lerp(Target, Alpha)
+    -- Sample the actual mouse position.
+    -- No cursor interpolation: avoids the floaty cursor delay.
+    if Effects.TrailEnabled
+        and not UsingGamepad
+        and FrameCounter % math.max(1, Effects.TrailSampleRate) == 0 then
 
-        Cursor.Position = UDim2.fromOffset(
-            CursorPosition.X,
-            CursorPosition.Y
-        )
+        table.insert(TrailPositions, 1, Position)
+        table.remove(TrailPositions, #TrailPositions + 1)
 
-        local Previous = CursorPosition
+        for Index, Image in ipairs(TrailImages) do
+            local TrailPosition = TrailPositions[Index]
 
-        for _, Item in ipairs(TrailItems) do
-            local TrailAlpha = 1 - math.exp(
-                -Effects.CursorSmoothness * 0.75 * DeltaTime
+            Image.Position = UDim2.fromOffset(
+                TrailPosition.X,
+                TrailPosition.Y
             )
 
-            Item.Position = Item.Position:Lerp(
-                Previous,
-                TrailAlpha
+            -- Older copies become increasingly transparent.
+            local Age = (Index - 1) / math.max(1, #TrailImages - 1)
+
+            Image.ImageTransparency = math.clamp(
+                1 - Effects.TrailOpacity * (1 - Age),
+                0,
+                1
             )
 
-            Item.Object.Position = UDim2.fromOffset(
-                Item.Position.X,
-                Item.Position.Y
-            )
-
-            Previous = Item.Position
+            Image.Visible = true
+        end
+    else
+        for _, Image in ipairs(TrailImages) do
+            Image.Visible = not UsingGamepad
+                and Effects.TrailEnabled
         end
     end
 
-    -- Smooth scrolling interpolation
-    for Frame, Data in pairs(ScrollTargets) do
+    if UsingGamepad then
+        for _, Image in ipairs(TrailImages) do
+            Image.Visible = false
+        end
+    end
+
+    -- Eased scrolling
+    for Frame, Data in pairs(ScrollFrames) do
         if not Frame.Parent then
-            ScrollTargets[Frame] = nil
+            ScrollFrames[Frame] = nil
         else
             local Alpha = 1 - math.exp(
                 -Effects.ScrollSmoothness * DeltaTime
             )
 
-            Data.Position = Data.Position:Lerp(Data.Target, Alpha)
+            Data.Current = Data.Current:Lerp(
+                Data.Target,
+                Alpha
+            )
 
-            -- Prevent endless subpixel movement.
-            if (Data.Position - Data.Target).Magnitude < 0.1 then
-                Data.Position = Data.Target
+            if (Data.Current - Data.Target).Magnitude < 0.1 then
+                Data.Current = Data.Target
             end
 
-            if (Frame.CanvasPosition - Data.Position).Magnitude > 0.05 then
-                Frame.CanvasPosition = Data.Position
+            if (Frame.CanvasPosition - Data.Current).Magnitude > 0.05 then
+                Frame.CanvasPosition = Data.Current
             end
         end
     end
 
-    -- Fade scene blur in and out
-    local BlurAlpha = 1 - math.exp(
-        -Effects.BlurFadeSpeed * DeltaTime
+    -- Fade scene blur after scrolling.
+    ScrollBlurAmount = math.max(
+        0,
+        ScrollBlurAmount
+            - Effects.ScrollBlurFadeSpeed * DeltaTime
     )
 
-    if os.clock() - (ScrollBlur.LastInput or 0) > 0.12 then
-        ScrollBlurAmount = ScrollBlurAmount
-            * math.exp(-Effects.BlurFadeSpeed * DeltaTime)
+    if Effects.ScrollBlurEnabled then
+        ScrollBlur.Size = ScrollBlur.Size
+            + (ScrollBlurAmount - ScrollBlur.Size)
+            * (1 - math.exp(-Effects.ScrollBlurFadeSpeed * DeltaTime))
+    else
+        ScrollBlur.Size = 0
     end
-
-    ScrollBlur.Size = ScrollBlur.Size
-        + (ScrollBlurAmount - ScrollBlur.Size) * BlurAlpha
 end)
 
 --==================================================
@@ -705,15 +773,9 @@ EffectsGui.Destroying:Connect(function()
         RenderConnection:Disconnect()
     end
 
-    UserInputService.MouseIconEnabled = true
-
     if ScrollBlur then
         ScrollBlur:Destroy()
     end
-
-    for _, Connection in pairs(ScrollConnections) do
-        Connection:Disconnect()
-    end
 end)
 
-print("[Legacy] Smooth cursor and UI effects initialized.")
+print("[Legacy] Loaded with cursor motion trails and smooth scrolling.")
