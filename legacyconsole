@@ -1,6 +1,6 @@
 -- https://github.com/wally-rblx
 -- forked old dev console to support solara (no require support)
--- ENHANCED: smooth motion + soft fade-behind motion blur + fade-in typing
+-- VISIBLE motion blur + reliable 0.3s typing fade
 
 local Instance_new = Instance.new
 local UDim2_new = UDim2.new
@@ -11,6 +11,8 @@ local math_floor = math.floor
 local math_abs = math.abs
 local math_exp = math.exp
 local math_clamp = math.clamp
+local math_sqrt = math.sqrt
+local math_atan2 = math.atan2
 local tick = tick
 local pairs = pairs
 local os_time = os.time
@@ -25,10 +27,6 @@ local SafeRequire = function(Module)
     if (Success) then return Result end
     return nil
 end
-
-local AnalyticsCategory_Game = "Game"
-local AnalyticsAction_InitialOpenTab = "DeveloperConsole_InitialOpenTab"
-local AnalyticsAction_ClickToOpenOpenTab = "DeveloperConsole_ClickToOpenOpenTab"
 
 local CoreGui = game:GetService("CoreGui")
 local RobloxGui = CoreGui:WaitForChild("NewRobloxGui", 5) or CoreGui:FindFirstChild("RobloxGui")
@@ -108,24 +106,26 @@ local Style; do
 
         ChartGraphDirection = 1;
 
-        -- ======== TUNING: SMOOTHNESS ========
-        PositionSmoothing = 22;    -- drag/resize lerp speed (1-exp(-k*dt))
+        -- ======== SMOOTHNESS ========
+        PositionSmoothing = 22;
         SizeSmoothing     = 20;
         ScrollSmoothing   = 14;
         ScrollFriction    = 6;
 
-        -- ======== TUNING: MOTION BLUR ========
-        MotionBlurEnabled         = true;
-        MotionBlurThreshold       = 2.5;    -- px of frame delta before ghost spawns
-        MotionBlurLifetime        = 0.4;    -- long soft fade
-        MotionBlurMaxGhosts       = 14;
-        MotionBlurBaseTransparency = 0.88;  -- very ghosty start, fades to 1.0
-        MotionBlurFrameZIndex     = 2;      -- main frame
-        MotionBlurGhostZIndex     = 1;      -- ghost sits BEHIND the frame
+        -- ======== MOTION BLUR (visible!) ========
+        MotionBlurEnabled     = true;
+        MotionBlurThreshold   = 1.5;     -- px movement before ghost spawns
+        MotionBlurLifetime    = 0.45;    -- ghost fade duration
+        MotionBlurMaxGhosts   = 25;      -- max simultaneous ghosts
+        MotionBlurBaseTransparency = 0.5; -- 0.5 = 50% opacity (VERY visible)
+        MotionBlurMaxTransparency  = 0.95; -- fade ends here
+        MotionBlurStretch     = 0.25;    -- stretch factor along velocity
+        MotionBlurFrameZIndex = 5;       -- frame layer
+        MotionBlurGhostZIndex = 4;       -- ghost layer (BEHIND frame)
 
-        -- ======== TUNING: TYPING FADE ========
-        MessageFadeDuration = 0.32;         -- new log lines fade in
-        CommandBarResizeDuration = 0.16;    -- command box grows smoothly
+        -- ======== TYPING FADE ========
+        MessageFadeDuration = 0.3;       -- exactly 0.3s as requested
+        CommandBarResizeDuration = 0.16;
 
         GetButtonDownColor = function(normalColor)
             local r, g, b = normalColor.r, normalColor.g, normalColor.b
@@ -143,7 +143,9 @@ local function smoothAlpha(speed, dt)
     return 1 - math_exp(-speed * dt)
 end
 
---[[ MOTION BLUR: soft ghosts BEHIND the frame ]]--
+--[[ ================================================================
+     MOTION BLUR — visible ghost trail, spawns along velocity path
+     ================================================================ ]]
 local MotionBlur = {}
 MotionBlur.__index = MotionBlur
 
@@ -180,36 +182,51 @@ function MotionBlur:Stop()
 end
 
 function MotionBlur:Update(dt)
-    if not self.Enabled or not self.TargetFrame or not self.TargetFrame.Parent then return end
-
-    local pos = self.TargetFrame.AbsolutePosition
-    local size = self.TargetFrame.AbsoluteSize
-
-    -- Age ghosts with eased cubic-out fade
+    -- Age and fade ghosts (cubic-out easing)
     for i = #self.Ghosts, 1, -1 do
         local g = self.Ghosts[i]
-        g.Life = g.Life + dt
-        local progress = g.Life / g.MaxLife
-        if progress >= 1 then
-            if g.Frame then g.Frame:Destroy() end
+        if not g.Frame or not g.Frame.Parent then
             table.remove(self.Ghosts, i)
         else
-            if g.Frame then
-                local eased = 1 - (1 - progress)^3  -- cubic out
-                g.Frame.BackgroundTransparency = g.BaseTransparency + eased * (1 - g.BaseTransparency)
+            g.Elapsed = g.Elapsed + dt
+            local progress = g.Elapsed / g.Lifetime
+            if progress >= 1 then
+                g.Frame:Destroy()
+                table.remove(self.Ghosts, i)
+            else
+                -- Cubic-out ease for soft fade
+                local eased = 1 - (1 - progress) * (1 - progress) * (1 - progress)
+                g.Frame.BackgroundTransparency = g.StartTransparency
+                    + eased * (Style.MotionBlurMaxTransparency - g.StartTransparency)
             end
         end
     end
 
-    if self.LastPos and self.LastSize then
-        local dx = math_abs(pos.X - self.LastPos.X)
-        local dy = math_abs(pos.Y - self.LastPos.Y)
-        local dw = math_abs(size.X - self.LastSize.X)
-        local dh = math_abs(size.Y - self.LastSize.Y)
-        local movement = dx + dy + dw + dh
+    if not self.Enabled or not self.TargetFrame or not self.TargetFrame.Parent then
+        return
+    end
 
-        if movement > Style.MotionBlurThreshold and #self.Ghosts < Style.MotionBlurMaxGhosts then
-            self:SpawnGhost(self.LastPos, self.LastSize)
+    local pos = self.TargetFrame.AbsolutePosition
+    local size = self.TargetFrame.AbsoluteSize
+
+    if self.LastPos and self.LastSize then
+        local dx = pos.X - self.LastPos.X
+        local dy = pos.Y - self.LastPos.Y
+        local dw = size.X - self.LastSize.X
+        local dh = size.Y - self.LastSize.Y
+        local dist = math_sqrt(dx*dx + dy*dy) + math_abs(dw) + math_abs(dh)
+
+        if dist > Style.MotionBlurThreshold then
+            -- Spawn 1-3 ghosts along the movement path this frame
+            local ghostsToSpawn = math_clamp(math_ceil(dist / 6), 1, 3)
+            for k = 1, ghostsToSpawn do
+                local t = k / (ghostsToSpawn + 1)
+                local gx = self.LastPos.X + dx * t
+                local gy = self.LastPos.Y + dy * t
+                local gw = self.LastSize.X + dw * t
+                local gh = self.LastSize.Y + dh * t
+                self:SpawnGhost(gx, gy, gw, gh, dx, dy, dist)
+            end
         end
     end
 
@@ -217,27 +234,101 @@ function MotionBlur:Update(dt)
     self.LastSize = size
 end
 
-function MotionBlur:SpawnGhost(pos, size)
+function MotionBlur:SpawnGhost(x, y, w, h, dx, dy, speed)
+    -- Enforce max ghost count
+    if #self.Ghosts >= Style.MotionBlurMaxGhosts then
+        local oldest = table.remove(self.Ghosts, 1)
+        if oldest and oldest.Frame then oldest.Frame:Destroy() end
+    end
+
     local ghost = Instance.new("Frame")
     ghost.BackgroundColor3 = Style.FrameColor
-    ghost.BackgroundTransparency = Style.MotionBlurBaseTransparency
     ghost.BorderSizePixel = 0
     ghost.ZIndex = Style.MotionBlurGhostZIndex
     ghost.Active = false
-    ghost.Position = UDim2.new(0, pos.X - self.ScreenGui.AbsolutePosition.X,
-                               0, pos.Y - self.ScreenGui.AbsolutePosition.Y)
-    ghost.Size = UDim2.new(0, size.X, 0, size.Y)
+    ghost.Selectable = false
+
+    -- Stretch ghost along dominant movement axis for streak effect
+    local stretch = math_min(1 + speed * 0.008, 1 + Style.MotionBlurStretch)
+    local stretchX = w * stretch
+    local stretchY = h * stretch
+
+    local parentAbs = self.ScreenGui.AbsolutePosition
+    local px = x - parentAbs.X - (stretchX - w) / 2
+    local py = y - parentAbs.Y - (stretchY - h) / 2
+
+    ghost.Position = UDim2.new(0, px, 0, py)
+    ghost.Size = UDim2.new(0, stretchX, 0, stretchY)
+
+    -- Base transparency gets lower (more visible) with speed
+    local baseTrans = Style.MotionBlurBaseTransparency
+        - math_min(0.15, speed * 0.001)
+    baseTrans = math_max(0.35, baseTrans)
+    ghost.BackgroundTransparency = baseTrans
+
     ghost.Parent = self.ScreenGui
 
     table.insert(self.Ghosts, {
         Frame = ghost;
-        Life = 0;
-        MaxLife = Style.MotionBlurLifetime;
-        BaseTransparency = Style.MotionBlurBaseTransparency;
+        Elapsed = 0;
+        Lifetime = Style.MotionBlurLifetime;
+        StartTransparency = baseTrans;
     })
 end
 
---[[ SMOOTH FRAME ANIMATOR ]]--
+local math_ceil = math.ceil
+
+--[[ ================================================================
+     TYPING FADE — manual render stepped, works everywhere
+     ================================================================ ]]
+local TextFades = {}       -- label -> {Elapsed, Duration}
+local TextFadeConn = nil
+
+local function EnsureTextFadeLoop()
+    if TextFadeConn then return end
+    TextFadeConn = RunService.RenderStepped:Connect(function(dt)
+        local hasAny = false
+        for label, data in pairs(TextFades) do
+            hasAny = true
+            if not label or not label.Parent then
+                TextFades[label] = nil
+            else
+                data.Elapsed = data.Elapsed + dt
+                local t = data.Elapsed / data.Duration
+                if t >= 1 then
+                    label.TextTransparency = 0
+                    TextFades[label] = nil
+                else
+                    -- Quad-out easing
+                    local eased = 1 - (1 - t) * (1 - t)
+                    label.TextTransparency = 1 - eased
+                end
+            end
+        end
+        if not hasAny and TextFadeConn then
+            TextFadeConn:Disconnect()
+            TextFadeConn = nil
+        end
+    end)
+end
+
+local function StartTextFade(label, duration)
+    duration = duration or Style.MessageFadeDuration
+    label.TextTransparency = 1
+    TextFades[label] = { Elapsed = 0; Duration = duration; }
+    EnsureTextFadeLoop()
+end
+
+local function StopTextFade(label)
+    if TextFades[label] then
+        label.TextTransparency = 0
+        TextFades[label] = nil
+    end
+end
+
+--[[ ================================================================
+     SMOOTH FRAME ANIMATOR
+     ================================================================ ]]
 local SmoothFrame = {}
 SmoothFrame.__index = SmoothFrame
 
@@ -274,20 +365,11 @@ function SmoothFrame:Start()
 end
 
 function SmoothFrame:Stop()
-    if self.Conn then
-        self.Conn:Disconnect()
-        self.Conn = nil
-    end
+    if self.Conn then self.Conn:Disconnect(); self.Conn = nil end
 end
 
-function SmoothFrame:SetTargetPosition(x, y)
-    self.tX, self.tY = x, y
-end
-
-function SmoothFrame:SetTargetSize(w, h)
-    self.tW, self.tH = w, h
-end
-
+function SmoothFrame:SetTargetPosition(x, y) self.tX, self.tY = x, y end
+function SmoothFrame:SetTargetSize(w, h) self.tW, self.tH = w, h end
 function SmoothFrame:Snap(x, y, w, h)
     if x then self.tX = x; self.cX = x end
     if y then self.tY = y; self.cY = y end
@@ -318,79 +400,38 @@ local Primitives = {}; do
     end
 
     function Primitives.Frame(parent, name)
-        local n = new('Frame', parent, name)
-        setupFrame(n)
-        return n
+        local n = new('Frame', parent, name); setupFrame(n); return n
     end
     function Primitives.TextLabel(parent, name, text)
-        local n = new('TextLabel', parent, name)
-        setupFrame(n)
-        setupText(n, text)
-        return n
+        local n = new('TextLabel', parent, name); setupFrame(n); setupText(n, text); return n
     end
     function Primitives.TextBox(parent, name, text)
-        local n = new('TextBox', parent, name)
-        setupFrame(n)
-        setupText(n, text)
-        return n
+        local n = new('TextBox', parent, name); setupFrame(n); setupText(n, text); return n
     end
     function Primitives.TextButton(parent, name, text)
-        local n = new('TextButton', parent, name)
-        setupFrame(n)
-        setupText(n, text)
-        return n
+        local n = new('TextButton', parent, name); setupFrame(n); setupText(n, text); return n
     end
     function Primitives.Button(parent, name)
-        local n = new('TextButton', parent, name)
-        setupFrame(n)
-        n.Text = ""
-        return n
+        local n = new('TextButton', parent, name); setupFrame(n); n.Text = ""; return n
     end
     function Primitives.ImageButton(parent, name, image)
-        local n = new('ImageButton', parent, name)
-        setupFrame(n)
-        n.Image = image or ""
-        n.Size = unitSize
-        return n
+        local n = new('ImageButton', parent, name); setupFrame(n); n.Image = image or ""; n.Size = unitSize; return n
     end
-
     function Primitives.FolderFrame(parent, name)
-        local n = new('Frame', parent, name)
-        n.BackgroundTransparency = 1
-        n.Size = unitSize
-        return n
+        local n = new('Frame', parent, name); n.BackgroundTransparency = 1; n.Size = unitSize; return n
     end
     function Primitives.InvisibleTextLabel(parent, name, text)
-        local n = new('TextLabel', parent, name)
-        setupText(n, text)
-        n.BackgroundTransparency = 1
-        return n
+        local n = new('TextLabel', parent, name); setupText(n, text); n.BackgroundTransparency = 1; return n
     end
     function Primitives.InvisibleButton(parent, name, text)
-        local n = new('TextButton', parent, name)
-        n.BackgroundTransparency = 1
-        n.Text = ""
-        return n
+        local n = new('TextButton', parent, name); n.BackgroundTransparency = 1; n.Text = ""; return n
     end
     function Primitives.InvisibleImageLabel(parent, name, image)
-        local n = new('ImageLabel', parent, name)
-        n.BackgroundTransparency = 1
-        n.Image = image or ""
-        n.Size = unitSize
-        return n
+        local n = new('ImageLabel', parent, name); n.BackgroundTransparency = 1; n.Image = image or ""; n.Size = unitSize; return n
     end
-end
-
-local function checkFFlag(flagName)
-    local flagSuccess, flagValue = pcall(function()
-        return settings():GetFFlag(flagName)
-    end)
-    return (flagSuccess and flagValue)
 end
 
 local EYECANDY_ENABLED = true
-
-local AUTO_TAB_WIDTH = -1
 local TAB_TEXT_SIZE = 14
 local TAB_TEXT_PADDING = 8
 
@@ -401,34 +442,19 @@ local function CreateSignal()
 
     function this:connect(func)
         if self ~= this then error("connect must be called with `:`, not `.`", 2) end
-        if type(func) ~= 'function' then
-            error("Argument #1 of connect must be a function, got a "..type(func), 2)
-        end
+        if type(func) ~= 'function' then error("Argument #1 of connect must be a function, got a "..type(func), 2) end
         local cn = mBindableEvent.Event:Connect(func)
         mAllCns[cn] = true
         local pubCn = {}
-        function pubCn:disconnect()
-            cn:Disconnect()
-            mAllCns[cn] = nil
-        end
+        function pubCn:disconnect() cn:Disconnect(); mAllCns[cn] = nil end
         pubCn.Disconnect = pubCn.disconnect
         return pubCn
     end
-
     function this:disconnect()
-        for cn, _ in pairs(mAllCns) do
-            cn:Disconnect()
-            mAllCns[cn] = nil
-        end
+        for cn, _ in pairs(mAllCns) do cn:Disconnect(); mAllCns[cn] = nil end
     end
-
-    function this:wait()
-        return mBindableEvent.Event:Wait()
-    end
-
-    function this:fire(...)
-        mBindableEvent:Fire(...)
-    end
+    function this:wait() return mBindableEvent.Event:Wait() end
+    function this:fire(...) mBindableEvent:Fire(...) end
 
     this.Connect = this.connect
     this.Disconnect = this.disconnect
@@ -452,11 +478,7 @@ local CreateDisconnectSignal; do
         end
         local listener;
         listener = this.Signal:connect(function(...)
-            if listener then
-                listener:disconnect()
-                listener = nil
-                func(...)
-            end
+            if listener then listener:disconnect(); listener = nil; func(...) end
         end)
         return listener
     end
@@ -470,7 +492,6 @@ local RunService = game:GetService('RunService')
 local TouchEnabled = UserInputService.TouchEnabled
 
 local DeveloperConsole = {}
-
 local Methods = {}
 local Metatable = {__index = Methods}
 
@@ -509,9 +530,7 @@ function Methods.ResetFrameDimensions(devConsole)
     end
 end
 
-function Methods.BoundFrameSize(devConsole, x, y)
-    return math_max(x, 400), math_max(y, 200)
-end
+function Methods.BoundFrameSize(devConsole, x, y) return math_max(x, 400), math_max(y, 200) end
 
 function Methods.SetFrameSize(devConsole, x, y)
     x, y = devConsole:BoundFrameSize(x, y)
@@ -522,9 +541,7 @@ function Methods.SetFrameSize(devConsole, x, y)
     end
 end
 
-function Methods.BoundFramePosition(devConsole, x, y)
-    return x, math_max(y, 0)
-end
+function Methods.BoundFramePosition(devConsole, x, y) return x, math_max(y, 0) end
 
 function Methods.SetFramePosition(devConsole, x, y)
     x, y = devConsole:BoundFramePosition(x, y)
@@ -539,22 +556,14 @@ function Methods.SetVisible(devConsole, visible, animate)
     if devConsole.Visible == visible then return end
     devConsole.Visible = visible
     devConsole.VisibleChanged:fire(visible)
-    if devConsole.Frame then
-        devConsole.Frame.Visible = visible
-    end
+    if devConsole.Frame then devConsole.Frame.Visible = visible end
     if visible then
         devConsole:ResetFrameDimensions()
         local tab = devConsole:GetCurrentOpenTab()
-        if (tab ~= nil) then
-            tab:RecordInitialOpen()
-        end
-        if devConsole.MotionBlur then
-            devConsole.MotionBlur:Start()
-        end
+        if (tab ~= nil) then tab:RecordInitialOpen() end
+        if devConsole.MotionBlur then devConsole.MotionBlur:Start() end
     else
-        if devConsole.MotionBlur then
-            devConsole.MotionBlur:Stop()
-        end
+        if devConsole.MotionBlur then devConsole.MotionBlur:Stop() end
     end
     if VRService.VREnabled then
         if visible then
@@ -566,7 +575,6 @@ function Methods.SetVisible(devConsole, visible, animate)
 end
 
 function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
-
     local visibleChanged = CreateSignal()
 
     local devConsole = {
@@ -581,18 +589,15 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
     }
 
     setmetatable(devConsole, Metatable)
-
     devConsole:EnableGUIMouse()
 
     local frame = Primitives.Button(screenGui, 'DeveloperConsole')
     frame.AutoButtonColor = false
     frame.Visible = devConsole.Visible
     frame.Selectable = not isTenFootInterface
-    frame.ZIndex = Style.MotionBlurFrameZIndex   -- >>> render ABOVE ghost
+    frame.ZIndex = Style.MotionBlurFrameZIndex
 
-    local function onVREnabled()
-        frame.Modal = VRService.VREnabled
-    end
+    local function onVREnabled() frame.Modal = VRService.VREnabled end
     onVREnabled()
     VRService:GetPropertyChangedSignal("VREnabled"):connect(onVREnabled)
 
@@ -636,14 +641,13 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
         return button, buttonImage
     end
 
-    do -- Exit
+    do -- Exit button
         local exitButton, exitButtonImage = createCornerButton('Exit', 1, 0, 'https://www.roblox.com/asset/?id=261878266', 2/3)
         exitButton.AutoButtonColor = false
         exitButton.Visible = not isTenFootInterface
         exitButton.Selectable = not isTenFootInterface
 
         local buttonEffectFunction = devConsole:CreateButtonEffectFunction(exitButton)
-
         devConsole:ConnectButtonHover(exitButton, function(clicking, hovering)
             if hovering and not clicking then
                 setCornerButtonImageSize(exitButtonImage, 3/4)
@@ -652,39 +656,28 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
             end
             buttonEffectFunction(clicking, hovering)
         end)
-
-        exitButton.MouseButton1Click:connect(function()
-            devConsole:SetVisible(false, true)
-        end)
+        exitButton.MouseButton1Click:connect(function() devConsole:SetVisible(false, true) end)
     end
 
-    do -- Repositioning and Resizing
-        do -- Resize
+    do -- Resize + drag
+        do
             local resizeButton, resizeButtonImage = createCornerButton('Resize', 1, 1, 'https://www.roblox.com/asset/?id=261880743', 1)
             resizeButtonImage.Position = UDim2_new(0, 0, 0, 0)
             resizeButtonImage.Size = UDim2_new(1, 0, 1, 0)
             resizeButton.Selectable = not isTenFootInterface
 
             local buttonEffectFunction = devConsole:CreateButtonEffectFunction(resizeButton)
-
             devConsole:ConnectButtonDragging(resizeButton, function()
                 local x0, y0 = sf.tW, sf.tH
-                return function(dx, dy)
-                    devConsole:SetFrameSize(x0 + dx, y0 + dy)
-                end
-            end, function(clicking, hovering)
-                buttonEffectFunction(clicking, hovering)
-            end)
+                return function(dx, dy) devConsole:SetFrameSize(x0 + dx, y0 + dy) end
+            end, function(clicking, hovering) buttonEffectFunction(clicking, hovering) end)
         end
 
-        do -- Handle drag
+        do
             local buttonEffectFunction = devConsole:CreateButtonEffectFunction(handle)
-
             devConsole:ConnectButtonDragging(handle, function()
                 local startX, startY = sf.tX, sf.tY
-                return function(x, y)
-                    devConsole:SetFramePosition(startX + x, startY + y)
-                end
+                return function(x, y) devConsole:SetFramePosition(startX + x, startY + y) end
             end, buttonEffectFunction)
         end
     end
@@ -711,7 +704,6 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
         scrollbarFrame.Parent = frame
         scrollbarFrame.Size = UDim2_new(0, Style.HandleHeight, 1, -(Style.HandleHeight + Style.BorderSize) * 2)
         scrollbarFrame.Position = UDim2_new(1, -Style.HandleHeight, 0, Style.HandleHeight + Style.BorderSize)
-
         devConsole:ApplyScrollbarToFrame(scrollbar, window, body, frame)
     end
 
@@ -729,6 +721,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
     local optionsFrame = Primitives.FolderFrame(optionsClippingFrame, 'OptionsFrame')
     optionsFrame.Size = UDim2_new(1, 0, 0, Style.OptionAreaHeight)
     optionsFrame.Position = UDim2_new(0, 0, 0, Style.OptionAreaHeight)
+
     do -- Options animation
         local gearSize = Style.GearSize
         local tabHeight = Style.TabHeight
@@ -738,10 +731,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
         local gear = Primitives.InvisibleImageLabel(optionsButton, 'Image', 'https://www.roblox.com/asset/?id=261882463')
         local animationToggle = devConsole:GenerateOptionButtonAnimationToggle(interiorFrame, optionsButton, gear, tabContainer, optionsClippingFrame, optionsFrame)
         local open = false
-        optionsButton.MouseButton1Click:connect(function()
-            open = not open
-            animationToggle(open)
-        end)
+        optionsButton.MouseButton1Click:connect(function() open = not open; animationToggle(open) end)
     end
 
     local setShownOptionTypes;
@@ -749,6 +739,7 @@ function DeveloperConsole.new(screenGui, permissions, messagesAndStats)
     local textFilterChanged, scriptStatFilterChanged;
     local messageFilter;
     local messageFilterChanged, messageTextWrappedChanged;
+
     do -- Options
         local function createCheckbox(color, callback)
             local this = { Value = true; }
@@ -1066,7 +1057,7 @@ do
     end
 end
 
-do -- Command Line with SMOOTH resize
+do -- Command Line with smooth resize
     function Methods.CreateCommandLine(devConsole)
         local this = { CommandInputted = CreateSignal(); }
 
@@ -1110,17 +1101,13 @@ do -- Command Line with SMOOTH resize
             textBox.SelectionImageObject = selectionImage
         end
 
-        do -- SMOOTH textbox resize
+        do
             local defaultSize = UDim2_new(1, 0, 0, Style.CommandLineHeight)
             local first = true
             local lastTarget = nil
-
             textBox.Changed:connect(function(property)
                 if property == 'TextBounds' or property == 'AbsoluteSize' then
-                    if first then
-                        first = false
-                        return
-                    end
+                    if first then first = false; return end
                     local textBounds = textBox.TextBounds
                     local targetSize = (textBounds.Y > Style.CommandLineHeight)
                         and UDim2_new(1, 0, 0, textBounds.Y + 2)
@@ -1142,10 +1129,7 @@ do -- Command Line with SMOOTH resize
         local isLastWeak = false
         local function addInputtedText(text, weak)
             if isLastWeak then table.remove(inputtedText, 1) end
-            if inputtedText[1] == text then
-                isLastWeak = isLastWeak and weak
-                return
-            end
+            if inputtedText[1] == text then isLastWeak = isLastWeak and weak; return end
             isLastWeak = weak
             if not weak then
                 for i = #inputtedText, 1, -1 do
@@ -1158,9 +1142,7 @@ do -- Command Line with SMOOTH resize
             backtrackPosition = backtrackPosition + direction
             if backtrackPosition < 1 then backtrackPosition = 1
             elseif backtrackPosition > #inputtedText then backtrackPosition = #inputtedText end
-            if inputtedText[backtrackPosition] then
-                textBox.Text = inputtedText[backtrackPosition]
-            end
+            if inputtedText[backtrackPosition] then textBox.Text = inputtedText[backtrackPosition] end
         end
 
         local focusLostWithoutEnter = false
@@ -1203,11 +1185,14 @@ do -- Command Line with SMOOTH resize
     end
 end
 
-do -- Output with SMOOTH typing fade-in
+do -- Output with reliable 0.3s typing fade
     local padding = 5
     local LabelSize = UDim2_new(1, -padding, 0, 2048)
     local TextColors = Style.MessageColors
     local TextColorUnknown = Color3_new(0.5, 0, 1)
+
+    -- Track which messages have been faded (weak keys, no leak)
+    local FadedMessages = setmetatable({}, {__mode = "k"})
 
     function Methods.CreateOutput(devConsole, messages, messageFilter)
         local heightChanged = CreateSignal()
@@ -1261,30 +1246,15 @@ do -- Output with SMOOTH typing fade-in
         end
         local MAX_LINES = 2048
 
-        local function RefreshMessagesForReal(messageStartPosition)
+        local function RefreshMessagesForReal()
             if not output.Visible then return end
 
             local y = 1
             local labelPosition = 0
-            messageStartPosition = nil
-            if messageStartPosition then
-                local labelPositionLast;
-                for i = messageStartPosition, math_max(1, #messages - MAX_LINES), -1 do
-                    if labelPositions[i] then
-                        labelPositionLast = labelPositions[i]
-                        break
-                    end
-                end
-                if labels[labelPositionLast] then
-                    labelPosition = labelPositionLast
-                    local label = labels[labelPositionLast]
-                    y = label.Position.Y.Offset + label.Size.Y.Offset
-                else
-                    messageStartPosition = nil
-                end
-            end
 
-            for i = messageStartPosition or math_max(1, #messages - MAX_LINES), #messages do
+            local startIdx = math_max(1, #messages - MAX_LINES)
+
+            for i = startIdx, #messages do
                 local message = messages[i]
                 if messageFilter(message) then
                     labelPosition = labelPosition + 1
@@ -1298,23 +1268,28 @@ do -- Output with SMOOTH typing fade-in
                         label.FontSize = 'Size10'
                         label.TextXAlignment = 'Left'
                         label.TextYAlignment = 'Top'
-                        -- >>> start invisible for smooth typing fade
-                        label.TextTransparency = 1
+                        label.TextTransparency = 1   -- start invisible
                         labels[labelPosition] = label
                         isNewLabel = true
                     end
                     label.TextWrapped = textWrappedEnabled
                     label.Size = LabelSize
                     label.TextColor3 = TextColors[message.Type] or TextColorUnknown
-                    label.Text = message.Time .. " -- " .. message.Message
 
-                    if isNewLabel then
-                        -- >>> SMOOTH TYPING FADE-IN
-                        TweenService:Create(label, TweenInfo.new(
-                            Style.MessageFadeDuration,
-                            Enum.EasingStyle.Quad,
-                            Enum.EasingDirection.Out
-                        ), { TextTransparency = 0 }):Play()
+                    local newText = message.Time .. " -- " .. message.Message
+                    local textChanged = (label.Text ~= newText)
+                    label.Text = newText
+
+                    -- Fade in when either label is brand new OR its text just changed to a message not yet faded
+                    if not FadedMessages[message] then
+                        FadedMessages[message] = true
+                        -- Only fade if this label is actually visible in the current window
+                        if isNewLabel or textChanged then
+                            StartTextFade(label, Style.MessageFadeDuration)
+                        end
+                    elseif isNewLabel then
+                        -- Very old message being shown in a fresh label — instantly visible
+                        label.TextTransparency = 0
                     end
 
                     local height = label.TextBounds.Y
@@ -1329,6 +1304,7 @@ do -- Output with SMOOTH typing fade-in
             end
 
             for i = #labels, labelPosition + 1, -1 do
+                StopTextFade(labels[i])
                 labels[i]:Destroy()
                 labels[i] = nil
             end
@@ -1368,6 +1344,7 @@ do -- Output with SMOOTH typing fade-in
                 RefreshMessagesForReal()
             else
                 for i = #labels, 1, -1 do
+                    StopTextFade(labels[i])
                     labels[i]:Destroy()
                     labels[i] = nil
                 end
@@ -1409,7 +1386,6 @@ end
 
 function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
     body.Visible = false
-
     local tab = {
         Open = false;
         Visible = false;
@@ -1466,8 +1442,7 @@ function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
             if body then body.Visible = true end
             devConsole:RefreshTabs()
             TweenService:Create(textLabel, TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
-                Size = size1;
-                Position = position1;
+                Size = size1; Position = position1;
             }):Play()
             devConsole.CurrentOpenedTab = buttonFrame
         else
@@ -1478,8 +1453,7 @@ function Methods.AddTab(devConsole, text, body, openCallback, visibleCallback)
                 devConsole.Frame.Interior.WindowContainer.Window.Body.Position = UDim2_new(0, 0, 0, 0)
             end
             TweenService:Create(textLabel, TweenInfo.new(0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
-                Size = size0;
-                Position = position0;
+                Size = size0; Position = position0;
             }):Play()
         end
 
@@ -1619,7 +1593,6 @@ end
 
 function Methods.CreateScrollbar(devConsole, rotation)
     local scrollbar = {}
-
     local main = nil
     main = Primitives.FolderFrame(main, 'Scrollbar')
     scrollbar.Frame = main
@@ -1839,7 +1812,6 @@ function Methods.GenerateOptionButtonAnimationToggle(devConsole, interior, butto
 end
 
 do
-    local globalInteractEvent = CreateSignal()
     function Methods.ConnectButtonHover(devConsole, button, mouseInteractCallback)
         local clicking = false
         local hovering = false
@@ -1850,7 +1822,6 @@ do
                 mouseInteractCallback(clicking, hovering)
             end
         end
-
         button.MouseButton1Down:connect(function() set(true, true) end)
         button.MouseButton1Up:connect(function() set(false, true) end)
         button.MouseEnter:connect(function() set(clicking, true) end)
@@ -1916,16 +1887,10 @@ function Methods.ConnectButtonDragging(devConsole, button, dragCallback, mouseIn
     end)
 
     button.MouseEnter:connect(function()
-        if not hovering then
-            hovering = true
-            mouseInteractCallback(dragging, hovering)
-        end
+        if not hovering then hovering = true; mouseInteractCallback(dragging, hovering) end
     end)
     button.MouseLeave:connect(function()
-        if hovering then
-            hovering = false
-            mouseInteractCallback(dragging, hovering)
-        end
+        if hovering then hovering = false; mouseInteractCallback(dragging, hovering) end
     end)
 
     devConsole.VisibleChanged:connect(stopDragging)
@@ -2023,11 +1988,10 @@ do
         local warningsToFilter = {"ClassDescriptor failed to learn", "EventDescriptor failed to learn", "Type failed to learn"}
         local function filterMessageOnAdd(message)
             if message.Type ~= Enum.MessageType.MessageWarning.Value then return false end
-            local found = false
             for _, filterString in ipairs(warningsToFilter) do
-                if string.find(message.Message, filterString) ~= nil then found = true; break end
+                if string.find(message.Message, filterString) ~= nil then return true end
             end
-            return found
+            return false
         end
 
         local outputMessageSyncLocal;
