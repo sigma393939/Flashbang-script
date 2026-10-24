@@ -1,97 +1,52 @@
 
---[[
-    RBXM Suite + Optional Legacy Cursor Effects
-    Based on RBXM Suite by 0866
-    Original project: https://github.com/richie0866/rbxm-suite/
-    License: MIT
+--========================================================
+-- LEGACY ROBLOX + SMOOTH CURSOR TRAIL
+--========================================================
 
-    Optional effects:
-    - Arrow-image cursor trail on PC
-    - Gamepad-only dot indicator
-    - Native PC mouse cursor remains enabled
+local Settings = {
+    Year = 2012,
+    OldGraphics = true,
+    HideDisplayName = true,
+    SafeChat = true,
+    OldConsole = true,
+    OldBubbleChat = true,
 
-    Enable by passing:
-        legacyVisualEffects = true
-    to Suite.launch(url, options).
-]]
+    CursorTrail = true,
+    CursorTrailCount = 10,
+    CursorFollowSpeed = 38,
 
----@class Options
----@field runscripts boolean
----@field deferred boolean
----@field nocache boolean
----@field nocirculardeps boolean
----@field debug boolean
----@field verbose boolean
----@field legacyVisualEffects boolean
+    MotionBlur = true,
+    MaxMotionBlur = 5,
+}
 
-local PROGRAM_NAME = "rbxm-suite"
-local PROGRAM_STORAGE = "_rbxm-suite-v2"
-local PROGRAM_TEMP = PROGRAM_STORAGE .. "/temp.dat"
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
 
-local HttpService = game:GetService("HttpService")
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
 
-local pathToUrl = getcustomasset or getsynasset
-    or error("Failed to load model! (No custom asset loader found)")
+--========================================================
+-- CLEANUP
+--========================================================
 
-local function useGlobal(key, initialValue)
-    local env = getgenv()
-    local globalKey = "__rbxm_suite_" .. key
-    local value = env[globalKey]
-
-    if value == nil then
-        value = initialValue
-        env[globalKey] = value
-    end
-
-    return value
+local previous = PlayerGui:FindFirstChild("LegacyMotionEffects")
+if previous then
+    previous:Destroy()
 end
 
-local function useOption(option, defaultValue)
-    if option == nil then
-        return defaultValue
-    end
-
-    return option
+local previousBlur = Lighting:FindFirstChild("LegacyMotionBlur")
+if previousBlur then
+    previousBlur:Destroy()
 end
 
-local function httpGet(url)
-    local response, code = game:HttpGet(url)
+--========================================================
+-- SMOOTH CURSOR EFFECTS
+--========================================================
 
-    return assert(
-        response,
-        "Error " .. tostring(code) .. ": Failed to GET from " .. url
-    )
-end
-
-local function log(message, verbose)
-    if verbose then
-        print(message)
-    end
-end
-
---==================================================
--- OPTIONAL LEGACY VISUAL EFFECTS
---==================================================
-
-local function startLegacyVisualEffects()
-    local Players = game:GetService("Players")
-    local UserInputService = game:GetService("UserInputService")
-    local RunService = game:GetService("RunService")
-
-    local Player = Players.LocalPlayer
-
-    if not Player then
-        return
-    end
-
-    local PlayerGui = Player:WaitForChild("PlayerGui")
-
-    local Existing = PlayerGui:FindFirstChild("LegacyMotionEffects")
-
-    if Existing then
-        Existing:Destroy()
-    end
-
+local function StartCursorEffects()
     local Gui = Instance.new("ScreenGui")
     Gui.Name = "LegacyMotionEffects"
     Gui.IgnoreGuiInset = true
@@ -101,20 +56,40 @@ local function startLegacyVisualEffects()
     Gui.Parent = PlayerGui
 
     pcall(function()
-        UserInputService.MouseIconEnabled = true
+        UIS.MouseIconEnabled = true
     end)
 
-    local TrailCount = 8
+    local Blur
+
+    if Settings.MotionBlur then
+        Blur = Instance.new("BlurEffect")
+        Blur.Name = "LegacyMotionBlur"
+        Blur.Size = 0
+        Blur.Parent = Lighting
+    end
+
     local Trail = {}
+    local TrailCount = math.clamp(Settings.CursorTrailCount, 1, 20)
+    local Mouse = UIS:GetMouseLocation()
+    local MousePosition = Vector2.new(Mouse.X, Mouse.Y)
+    local LastMousePosition = MousePosition
+    local CursorSpeed = 0
+    local CurrentBlur = 0
+    local GamepadMode = false
+    local Alive = true
 
     for i = 1, TrailCount do
         local Image = Instance.new("ImageLabel")
-        Image.Name = "ArrowTrail" .. i
+        Image.Name = "CursorTrail" .. i
         Image.BackgroundTransparency = 1
         Image.BorderSizePixel = 0
         Image.Image = "rbxasset://textures/ArrowCursor.png"
         Image.Size = UDim2.fromOffset(24, 24)
         Image.AnchorPoint = Vector2.zero
+        Image.Position = UDim2.fromOffset(
+            MousePosition.X,
+            MousePosition.Y
+        )
         Image.ImageTransparency = 1
         Image.Visible = false
         Image.ZIndex = i
@@ -122,13 +97,14 @@ local function startLegacyVisualEffects()
 
         Trail[i] = {
             Image = Image,
-            Position = UserInputService:GetMouseLocation(),
+            Position = MousePosition,
+            RenderPosition = MousePosition,
         }
     end
 
     local Dot = Instance.new("Frame")
-    Dot.Name = "GamepadCursor"
-    Dot.Size = UDim2.fromOffset(7, 7)
+    Dot.Name = "GamepadPointer"
+    Dot.Size = UDim2.fromOffset(8, 8)
     Dot.AnchorPoint = Vector2.new(0.5, 0.5)
     Dot.BackgroundColor3 = Color3.new(1, 1, 1)
     Dot.BorderSizePixel = 0
@@ -140,559 +116,193 @@ local function startLegacyVisualEffects()
     Corner.CornerRadius = UDim.new(1, 0)
     Corner.Parent = Dot
 
-    local Stroke = Instance.new("UIStroke")
-    Stroke.Color = Color3.new(0, 0, 0)
-    Stroke.Thickness = 1
-    Stroke.Parent = Dot
+    local Outline = Instance.new("UIStroke")
+    Outline.Color = Color3.new(0, 0, 0)
+    Outline.Thickness = 1
+    Outline.Parent = Dot
 
-    local GamepadActive = false
+    local function Alpha(Speed, DeltaTime)
+        return 1 - math.exp(-Speed * math.min(DeltaTime, 0.05))
+    end
 
-    local function SetInputMode(inputType)
-        if inputType.Name:match("^Gamepad") then
-            GamepadActive = true
-        elseif inputType == Enum.UserInputType.MouseMovement
-            or inputType == Enum.UserInputType.MouseButton1
-            or inputType == Enum.UserInputType.MouseButton2
-            or inputType == Enum.UserInputType.MouseButton3
-            or inputType == Enum.UserInputType.Touch then
-
-            GamepadActive = false
+    local function SetInputMode(InputType)
+        if InputType.Name:match("^Gamepad") then
+            GamepadMode = true
+        elseif InputType == Enum.UserInputType.MouseMovement
+            or InputType == Enum.UserInputType.MouseButton1
+            or InputType == Enum.UserInputType.MouseButton2
+            or InputType == Enum.UserInputType.MouseButton3
+            or InputType == Enum.UserInputType.Touch then
+            GamepadMode = false
         end
 
-        Dot.Visible = GamepadActive
+        Dot.Visible = GamepadMode
 
-        for _, entry in ipairs(Trail) do
-            entry.Image.Visible = not GamepadActive
+        for _, Entry in ipairs(Trail) do
+            Entry.Image.Visible = not GamepadMode
         end
     end
 
     local InputConnection =
-        UserInputService.LastInputTypeChanged:Connect(SetInputMode)
+        UIS.LastInputTypeChanged:Connect(SetInputMode)
 
-    SetInputMode(UserInputService:GetLastInputType())
+    SetInputMode(UIS:GetLastInputType())
 
-    local LastMouse = UserInputService:GetMouseLocation()
-    local Connection
+    local RenderConnection
 
-    Connection = RunService.RenderStepped:Connect(function(dt)
-        if not Gui.Parent then
-            Connection:Disconnect()
-            InputConnection:Disconnect()
+    RenderConnection = RunService.RenderStepped:Connect(function(DeltaTime)
+        if not Alive or not Gui.Parent then
             return
         end
 
-        local mouse = UserInputService:GetMouseLocation()
-        local current = Vector2.new(mouse.X, mouse.Y)
+        DeltaTime = math.min(DeltaTime, 0.05)
 
-        if GamepadActive then
-            Dot.Position = UDim2.fromOffset(current.X, current.Y)
+        local CurrentMouse = UIS:GetMouseLocation()
+        MousePosition = Vector2.new(CurrentMouse.X, CurrentMouse.Y)
 
-            for _, entry in ipairs(Trail) do
-                entry.Image.Visible = false
-            end
+        local Distance = (MousePosition - LastMousePosition).Magnitude
+        local InstantSpeed = Distance / math.max(DeltaTime, 1 / 240)
 
-            LastMouse = current
-            return
+        CursorSpeed +=
+            (math.min(InstantSpeed, 2600) - CursorSpeed) * Alpha(18, DeltaTime)
+
+        -- Shift the target positions along the trail.
+        for i = TrailCount, 2, -1 do
+            Trail[i].Position = Trail[i - 1].Position
         end
 
-        local moved = (current - LastMouse).Magnitude > 0.5
-        local followAlpha = 1 - math.exp(-35 * dt)
+        Trail[1].Position = MousePosition
 
-        for i = #Trail, 1, -1 do
-            local entry = Trail[i]
+        local IsMoving = Distance > 0.15 and not GamepadMode
 
-            if i == 1 then
-                entry.Position = entry.Position:Lerp(
-                    current,
-                    followAlpha
-                )
-            else
-                entry.Position = entry.Position:Lerp(
-                    Trail[i - 1].Position,
-                    followAlpha
-                )
-            end
+        for i, Entry in ipairs(Trail) do
+            local Fade = (i - 1) / TrailCount
+            local Follow = Settings.CursorFollowSpeed
+                * (1 - (i - 1) / (TrailCount * 1.5))
 
-            local age = (i - 1) / math.max(1, #Trail - 1)
-
-            entry.Image.Position = UDim2.fromOffset(
-                entry.Position.X,
-                entry.Position.Y
+            Entry.RenderPosition = Entry.RenderPosition:Lerp(
+                Entry.Position,
+                Alpha(Follow, DeltaTime)
             )
 
-            entry.Image.ImageTransparency = math.clamp(
-                0.22 + age * 0.78,
+            Entry.Image.Position = UDim2.fromOffset(
+                Entry.RenderPosition.X,
+                Entry.RenderPosition.Y
+            )
+
+            Entry.Image.ImageTransparency = math.clamp(
+                0.25 + Fade * 0.70,
                 0,
                 1
             )
 
-            entry.Image.Visible = moved
+            Entry.Image.Visible = IsMoving
         end
 
-        LastMouse = current
+        if Blur then
+            local TargetBlur = 0
+
+            if not GamepadMode then
+                TargetBlur = math.clamp(
+                    (CursorSpeed - 350) * 0.055,
+                    0,
+                    Settings.MaxMotionBlur
+                )
+            end
+
+            CurrentBlur +=
+                (TargetBlur - CurrentBlur) * Alpha(14, DeltaTime)
+
+            Blur.Size = CurrentBlur
+        end
+
+        Dot.Position = UDim2.fromOffset(
+            MousePosition.X,
+            MousePosition.Y
+        )
+
+        LastMousePosition = MousePosition
     end)
 
     Gui.Destroying:Connect(function()
-        if Connection then
-            Connection:Disconnect()
-        end
-
+        Alive = false
+        RenderConnection:Disconnect()
         InputConnection:Disconnect()
-    end)
-end
 
---==================================================
--- GITHUB INTEGRATION
---==================================================
-
-local github = {}
-
-local function init()
-    if not isfolder(PROGRAM_STORAGE) then
-        makefolder(PROGRAM_STORAGE)
-        makefolder(PROGRAM_STORAGE .. "/models")
-        writefile(PROGRAM_STORAGE .. "/latest.json", "{}")
-    elseif not isfolder(PROGRAM_STORAGE .. "/models") then
-        makefolder(PROGRAM_STORAGE .. "/models")
-    end
-
-    if not isfile(PROGRAM_STORAGE .. "/latest.json") then
-        writefile(PROGRAM_STORAGE .. "/latest.json", "{}")
-    end
-end
-
-local function updateLatestJson(mutate)
-    local data = readfile(PROGRAM_STORAGE .. "/latest.json")
-    local versions = HttpService:JSONDecode(data)
-
-    mutate(versions)
-
-    writefile(
-        PROGRAM_STORAGE .. "/latest.json",
-        HttpService:JSONEncode(versions)
-    )
-end
-
-local function getLocalTag(id)
-    local data = readfile(PROGRAM_STORAGE .. "/latest.json")
-    local versions = HttpService:JSONDecode(data)
-
-    return versions[id]
-end
-
-local function fetchLatestTag(user, repo)
-    local response = httpGet(
-        "https://api.github.com/repos/"
-        .. user .. "/" .. repo .. "/releases/latest"
-    )
-
-    return HttpService:JSONDecode(response).tag_name
-end
-
-local function downloadLatest(user, repo, asset, id, path)
-    local latestTag = fetchLatestTag(user, repo)
-
-    if isfile(path) and getLocalTag(id) == latestTag then
-        return path
-    end
-
-    local response = httpGet(
-        "https://github.com/"
-        .. user .. "/" .. repo
-        .. "/releases/latest/download/" .. asset
-    )
-
-    writefile(path, response)
-
-    updateLatestJson(function(versions)
-        versions[id] = latestTag
-    end)
-
-    return path
-end
-
-function github.download(user, repo, tag, asset)
-    local id = string.gsub(
-        table.concat({user, repo, tag, asset}, "-"),
-        "[^a-zA-Z0-9_%-]",
-        "_"
-    )
-
-    local path = PROGRAM_STORAGE .. "/models/" .. id .. ".rbxm"
-
-    if tag == "latest" then
-        if isfile(path) then
-            task.defer(downloadLatest, user, repo, asset, id, path)
-        else
-            downloadLatest(user, repo, asset, id, path)
-        end
-
-        return path
-    end
-
-    if isfile(path) then
-        return path
-    end
-
-    local response = httpGet(
-        "https://github.com/"
-        .. user .. "/" .. repo
-        .. "/releases/download/" .. tag .. "/" .. asset
-    )
-
-    writefile(path, response)
-
-    return path
-end
-
-function github.clearCache()
-    delfolder(PROGRAM_STORAGE)
-    init()
-end
-
-init()
-
---==================================================
--- MODULE RESOLUTION
---==================================================
-
-local modules = useGlobal("modules", {})
-local currentlyLoading = {}
-
-local idToScript = useGlobal("idToScript", {})
-local scriptToId = useGlobal("scriptToId", {})
-local globalMap = useGlobal("globalMap", {})
-
-local function loadModule(object, caller, allowRecursion)
-    local module = modules[object]
-
-    assert(module, "Module was not registered with RBXM Suite.")
-
-    if module.isLoaded then
-        return module.data
-    end
-
-    if caller and not allowRecursion then
-        currentlyLoading[caller] = object
-
-        local currentObject = object
-        local depth = 0
-
-        while currentObject do
-            depth += 1
-            currentObject = currentlyLoading[currentObject]
-
-            if currentObject == object then
-                error(
-                    "Failed to load '"
-                    .. object:GetFullName()
-                    .. "'! Detected a circular dependency.",
-                    2
-                )
-            end
-        end
-    end
-
-    local data = module.fn()
-
-    if caller and currentlyLoading[caller] == object then
-        currentlyLoading[caller] = nil
-    end
-
-    module.data = data
-    module.isLoaded = true
-
-    return data
-end
-
---==================================================
--- MODULE SOURCE BUNDLER
---==================================================
-
-local function createOutputStream()
-    local output = {}
-
-    return {
-        push = function(str)
-            table.insert(output, str)
-        end,
-
-        concat = function()
-            return table.concat(output)
-        end,
-    }
-end
-
-local function registerModule(object, allowRecursion)
-    local id = HttpService:GenerateGUID(false)
-
-    local function requireImpl(target)
-        if typeof(target) == "Instance" and modules[target] then
-            return loadModule(target, object, allowRecursion)
-        end
-
-        return require(target)
-    end
-
-    modules[object] = {
-        data = nil,
-        fn = nil,
-        isLoaded = false,
-    }
-
-    idToScript[id] = object
-    scriptToId[object] = id
-    globalMap[id] = {object, requireImpl}
-
-    return id
-end
-
-local function pushHeader(stream)
-    stream.push("local modules, globalMap, idToScript = ...\n")
-end
-
-local function pushModule(object, stream, options)
-    if not object:IsA("LocalScript")
-        and not object:IsA("ModuleScript") then
-        return
-    end
-
-    local id = string.format(
-        "%q",
-        registerModule(object, not options.nocirculardeps)
-    )
-
-    local path = string.format(
-        "%q",
-        "@" .. PROGRAM_NAME .. "." .. object:GetFullName()
-    )
-
-    if options.debug then
-        object.Source =
-            "local script, require = unpack((...)[" .. id .. "]); "
-            .. object.Source
-
-        stream.push(
-            "modules[idToScript[" .. id .. "]].fn = function ()\n"
-            .. "local fn, err = loadstring(idToScript[" .. id .. "].Source, "
-            .. path .. ")\n"
-            .. "return assert(fn, err)(globalMap)\n"
-            .. "end\n"
-        )
-
-        return
-    end
-
-    object.Source =
-        "local script, require = unpack(globalMap[" .. id .. "]); "
-        .. object.Source
-
-    stream.push(
-        "modules[idToScript[" .. id .. "]].fn = function ()\n"
-        .. object.Source .. "\nend\n"
-    )
-end
-
-local function initialize(stream)
-    assert(
-        loadstring(stream.concat(), "@" .. PROGRAM_NAME)
-    )(modules, globalMap, idToScript)
-end
-
---==================================================
--- MODEL LOADING
---==================================================
-
-local function getObjectsNoCache(url, isVerbose)
-    local assetId = string.match(url, "^rbxassetid://(%d+)$")
-
-    if not assetId then
-        return game:GetObjects(url)
-    end
-
-    local data = HttpService:JSONDecode(
-        httpGet(
-            "https://assetdelivery.roblox.com/v2/assetId/"
-            .. assetId
-        )
-    )
-
-    local rbxmData = httpGet(data.locations[1].location)
-
-    if rbxmData == "" then
-        log("Model data is blank; falling back to GetObjects.", isVerbose)
-        return game:GetObjects(url)
-    end
-
-    writefile(PROGRAM_TEMP, rbxmData)
-
-    local success, result = pcall(function()
-        return game:GetObjects(pathToUrl(PROGRAM_TEMP))
-    end)
-
-    pcall(delfile, PROGRAM_TEMP)
-
-    if not success then
-        log("Model load failed: " .. tostring(result), isVerbose)
-        return game:GetObjects(url)
-    end
-
-    return result
-end
-
-local function getObjects(url, options)
-    if string.find(url, "^rbxassetid://") then
-        if options.nocache then
-            return getObjectsNoCache(url, options.verbose)
-        end
-
-        return game:GetObjects(url)
-    end
-
-    return game:GetObjects(pathToUrl(url))
-end
-
-local function hydrate(stream, model, options)
-    pushModule(model, stream, options)
-
-    for _, object in ipairs(model:GetDescendants()) do
-        pushModule(object, stream, options)
-    end
-end
-
-local function startScript(object, index, options)
-    local spawnFunction = options.deferred and task.defer or task.spawn
-
-    spawnFunction(function()
-        log("Running " .. object:GetFullName(), options.verbose)
-
-        local success, err = pcall(loadModule, object)
-
-        if not success then
-            warn("[RBXM Suite] Script failed: " .. tostring(err))
-        else
-            log("Finished " .. object:GetFullName(), options.verbose)
+        if Blur then
+            Blur:Destroy()
         end
     end)
 end
 
-local function startScripts(model, options)
-    local index = 0
+if Settings.CursorTrail then
+    StartCursorEffects()
+end
 
-    if model:IsA("LocalScript") and not model.Disabled then
-        index += 1
-        startScript(model, index, options)
-    end
+--========================================================
+-- LEGACY SETTINGS
+--========================================================
 
-    for _, object in ipairs(model:GetDescendants()) do
-        if object:IsA("LocalScript") and not object.Disabled then
-            index += 1
-            startScript(object, index, options)
+if Settings.HideDisplayName then
+    local function UpdateCharacter(Character)
+        local Humanoid = Character:WaitForChild("Humanoid", 10)
+        if not Humanoid then
+            return
         end
+
+        Humanoid.DisplayDistanceType =
+            Enum.HumanoidDisplayDistanceType.Subject
     end
+
+    if Player.Character then
+        task.spawn(UpdateCharacter, Player.Character)
+    end
+
+    Player.CharacterAdded:Connect(UpdateCharacter)
 end
 
---==================================================
--- RBXM SUITE API
---==================================================
+if Settings.OldConsole then
+    pcall(function()
+        StarterGui:SetCore("TopbarEnabled", true)
+    end)
+end
 
-local function launch(url, opt)
-    assert(type(url) == "string", "The first argument must be a string.")
-    assert(
-        type(opt) == "table" or opt == nil,
-        "The options argument must be a table or nil."
+--========================================================
+-- LOAD LEGACY MODULE
+--========================================================
+
+local Suite = getgenv().Suite
+
+if not Suite then
+    local SuiteSource = game:HttpGet(
+        "https://raw.githubusercontent.com/sigma393939/Flashbang-script/main/rbxmsuit"
     )
 
-    opt = opt or {}
-
-    local options = {
-        runscripts = useOption(opt.runscripts, true),
-        deferred = useOption(opt.deferred, true),
-        nocache = useOption(opt.nocache, false),
-        nocirculardeps = useOption(opt.nocirculardeps, true),
-        debug = useOption(opt.debug, false),
-        verbose = useOption(opt.verbose, false),
-    }
-
-    log("Launching file: " .. url, options.verbose)
-
-    local started = os.clock()
-    local objects = getObjects(url, options)
-    local stream = createOutputStream()
-
-    pushHeader(stream)
-
-    for _, model in ipairs(objects) do
-        hydrate(stream, model, options)
-    end
-
-    initialize(stream)
-
-    if options.runscripts then
-        for _, model in ipairs(objects) do
-            startScripts(model, options)
-        end
-    end
-
-    -- Opt-in only. Doesn't change the loader's default behavior.
-    if opt.legacyVisualEffects == true then
-        task.defer(function()
-            local success, err = pcall(startLegacyVisualEffects)
-
-            if not success then
-                warn(
-                    "[RBXM Suite] Visual effects failed: "
-                    .. tostring(err)
-                )
-            end
-        end)
-    end
-
-    log(
-        string.format(
-            "Finished in %.2f ms.",
-            (os.clock() - started) * 1000
-        ),
-        options.verbose
-    )
-
-    return unpack(objects)
+    Suite = loadstring(SuiteSource)()
+    getgenv().Suite = Suite
 end
 
-local function requireModule(object)
-    assert(typeof(object) == "Instance", "Expected an Instance.")
-    assert(
-        object:IsA("LuaSourceContainer"),
-        "Expected a Lua script or module."
-    )
-    assert(modules[object], "The object wasn't registered with RBXM Suite.")
+local Path = Suite.download(
+    "yeku/legacy@latest",
+    "Legacy.rbxm"
+)
 
-    return loadModule(object)
-end
+local Legacy = Suite.launch(Path, {
+    runscripts = true,
+    debug = true,
+})
 
-local function download(repository, asset)
-    local user, repo, tag = string.match(
-        repository,
-        "([^/]+)/([^@]+)@?(.*)"
-    )
+if Legacy then
+    local Success, Module = pcall(function()
+        return Suite.require(Legacy)
+    end)
 
-    assert(user and repo, "Invalid repository format.")
-    assert(type(asset) == "string", "Asset must be a string.")
-
-    if tag == "" or tag == nil then
-        tag = "latest"
+    if Success and Module and Module.Start then
+        Module:Start(Settings.Year)
     end
-
-    return github.download(user, repo, tag, asset)
 end
 
-local function clearCache()
-    return github.clearCache()
-end
-
-return {
-    launch = launch,
-    require = requireModule,
-    download = download,
-    clearCache = clearCache,
-}
+-- Disable the default Roblox CoreGui only if the legacy UI
+-- successfully replaces the corresponding elements.
+-- Avoid disabling everything here, as it can leave the game
+-- without a working cursor, menu, or controls.
