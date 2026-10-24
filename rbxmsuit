@@ -1,736 +1,515 @@
 
 --[[
-    RBXM Suite
-    Author: 0866
-    License: MIT
-    GitHub: https://github.com/richie0866/rbxm-suite/
+    RBXM SUITE
+    Version: 2.0
+    Purpose: Download, cache, load, and launch RBXM models.
 
-    Extended with an optional Legacy visual-effects callback.
+    The Suite does not enable Legacy cursor effects by default.
+    The Branch script is responsible for its own cursor and blur effects.
 ]]
 
----@class Options
----@field runscripts boolean
----@field deferred boolean
----@field nocache boolean
----@field nocirculardeps boolean
----@field debug boolean
----@field verbose boolean
----@field legacyVisualEffects boolean
+local Suite = {}
+Suite.__index = Suite
 
-local PROGRAM_NAME = "rbxm-suite"
-local PROGRAM_STORAGE = "_rbxm-suite-v2"
-local PROGRAM_TEMP = PROGRAM_STORAGE .. "/temp.dat"
+local Env = (getgenv and getgenv()) or _G
+
+local ROOT = "_rbxm-suite-v2"
+local CACHE = ROOT .. "/cache"
+local MODULE_CACHE = {}
 
 local HttpService = game:GetService("HttpService")
 
-local pathToUrl = getcustomasset or getsynasset
-    or error("Failed to load model! (No custom asset loader found)")
-
 --==================================================
--- GLOBAL STATE
+-- FILESYSTEM
 --==================================================
 
-local function useGlobal(key, initialValue)
-    local env = getgenv()
-    local globalKey = "__rbxm_suite_" .. key
-
-    if env[globalKey] == nil then
-        env[globalKey] = initialValue
-    end
-
-    return env[globalKey]
+local function hasFileSystem()
+    return type(isfile) == "function"
+        and type(readfile) == "function"
+        and type(writefile) == "function"
+        and type(makefolder) == "function"
 end
 
-local function useOption(option, defaultValue)
-    if option == nil then
-        return defaultValue
+local function ensureFolder(path)
+    if not hasFileSystem() then
+        return false
     end
 
-    return option
+    if isfolder and isfolder(path) then
+        return true
+    end
+
+    pcall(makefolder, path)
+    return isfolder and isfolder(path) or false
 end
+
+local function ensureFolders()
+    ensureFolder(ROOT)
+    ensureFolder(CACHE)
+end
+
+local function safeRead(path)
+    if not hasFileSystem() or not isfile(path) then
+        return nil
+    end
+
+    local ok, result = pcall(readfile, path)
+    if ok then
+        return result
+    end
+
+    return nil
+end
+
+local function safeWrite(path, content)
+    if not hasFileSystem() then
+        return false
+    end
+
+    local ok = pcall(writefile, path, content)
+    return ok
+end
+
+local function safeDelete(path)
+    if not hasFileSystem() or type(delfile) ~= "function" then
+        return false
+    end
+
+    local ok = pcall(delfile, path)
+    return ok
+end
+
+local function normalizeName(name)
+    name = tostring(name or "asset")
+    name = name:gsub("[^%w%-%_%.]", "_")
+    return name
+end
+
+local function cachePath(name)
+    return CACHE .. "/" .. normalizeName(name)
+end
+
+ensureFolders()
+
+--==================================================
+-- HTTP
+--==================================================
 
 local function httpGet(url)
-    local response, code = game:HttpGet(url)
+    assert(type(url) == "string" and url ~= "", "A URL is required")
 
-    return assert(
-        response,
-        "Error " .. tostring(code) .. ": Failed to GET from " .. url
-    )
-end
+    local requestFunction =
+        (syn and syn.request)
+        or http_request
+        or request
 
-local function log(message, isVerbose)
-    if isVerbose then
-        print(message)
-    end
-end
+    if type(requestFunction) == "function" then
+        local ok, response = pcall(requestFunction, {
+            Url = url,
+            Method = "GET",
+        })
 
---==================================================
--- GITHUB INTEGRATION
---==================================================
+        if ok and response then
+            local status = response.StatusCode or response.Status or 200
+            local body = response.Body or response.body
 
-local github = {}
-
-local function init()
-    if not isfolder(PROGRAM_STORAGE) then
-        makefolder(PROGRAM_STORAGE)
-    end
-
-    if not isfolder(PROGRAM_STORAGE .. "/models") then
-        makefolder(PROGRAM_STORAGE .. "/models")
-    end
-
-    if not isfile(PROGRAM_STORAGE .. "/latest.json") then
-        writefile(PROGRAM_STORAGE .. "/latest.json", "{}")
-    end
-end
-
-local function updateLatestJson(mutate)
-    local data = readfile(PROGRAM_STORAGE .. "/latest.json")
-    local versions = HttpService:JSONDecode(data)
-
-    mutate(versions)
-
-    writefile(
-        PROGRAM_STORAGE .. "/latest.json",
-        HttpService:JSONEncode(versions)
-    )
-end
-
-local function getLocalTag(id)
-    local data = readfile(PROGRAM_STORAGE .. "/latest.json")
-    local versions = HttpService:JSONDecode(data)
-
-    return versions[id]
-end
-
-local function fetchLatestTag(user, repo)
-    local response = httpGet(
-        "https://api.github.com/repos/"
-            .. user .. "/" .. repo .. "/releases/latest"
-    )
-
-    return HttpService:JSONDecode(response).tag_name
-end
-
-local function downloadLatest(user, repo, asset, id, path)
-    local latestTag = fetchLatestTag(user, repo)
-
-    if isfile(path) and getLocalTag(id) == latestTag then
-        return path
-    end
-
-    local response = httpGet(
-        "https://github.com/"
-            .. user .. "/" .. repo
-            .. "/releases/latest/download/" .. asset
-    )
-
-    writefile(path, response)
-
-    updateLatestJson(function(versions)
-        versions[id] = latestTag
-    end)
-
-    -- Return the downloaded file path.
-    return path
-end
-
-function github.download(user, repo, tag, asset)
-    local id = string.gsub(
-        table.concat({user, repo, tag, asset}, "-"),
-        "[^a-zA-Z0-9_%-]",
-        "_"
-    )
-
-    local path = PROGRAM_STORAGE .. "/models/" .. id .. ".rbxm"
-
-    if tag == "latest" then
-        if isfile(path) then
-            -- Update an existing cache asynchronously.
-            task.defer(function()
-                local success, err = pcall(
-                    downloadLatest,
-                    user,
-                    repo,
-                    asset,
-                    id,
-                    path
-                )
-
-                if not success then
-                    warn("[RBXM Suite] Background update failed:", err)
-                end
-            end)
-
-            return path
-        end
-
-        return downloadLatest(user, repo, asset, id, path)
-    end
-
-    if isfile(path) then
-        return path
-    end
-
-    local response = httpGet(
-        "https://github.com/"
-            .. user .. "/" .. repo
-            .. "/releases/download/" .. tag .. "/" .. asset
-    )
-
-    writefile(path, response)
-
-    return path
-end
-
-function github.clearCache()
-    if isfolder(PROGRAM_STORAGE) then
-        delfolder(PROGRAM_STORAGE)
-    end
-
-    init()
-end
-
-init()
-
---==================================================
--- MODULE RESOLUTION
---==================================================
-
-local modules = useGlobal("modules", {})
-local currentlyLoading = {}
-
-local idToScript = useGlobal("idToScript", {})
-local scriptToId = useGlobal("scriptToId", {})
-local globalMap = useGlobal("globalMap", {})
-
-local function loadModule(object, caller, allowRecursion)
-    local module = modules[object]
-
-    assert(module, "The script was not registered with RBXM Suite.")
-
-    if module.isLoaded then
-        return module.data
-    end
-
-    if caller and not allowRecursion then
-        currentlyLoading[caller] = object
-
-        local currentObject = object
-        local depth = 0
-
-        while currentObject do
-            depth += 1
-            currentObject = currentlyLoading[currentObject]
-
-            if currentObject == object then
-                error(
-                    "Failed to load '"
-                        .. object:GetFullName()
-                        .. "'! Circular dependency detected.",
-                    2
-                )
+            if status >= 200 and status < 300 and body then
+                return body
             end
         end
     end
 
-    local success, data = pcall(module.fn)
+    assert(type(game.HttpGet) == "function",
+        "No supported HTTP method is available")
 
-    if caller and currentlyLoading[caller] == object then
-        currentlyLoading[caller] = nil
+    return game:HttpGet(url)
+end
+
+local function isHttpUrl(value)
+    return type(value) == "string"
+        and value:match("^https?://") ~= nil
+end
+
+-- Accepts a direct URL or a repository shorthand:
+-- "owner/repository@branch/path/to/file"
+local function resolveUrl(source)
+    if isHttpUrl(source) then
+        return source
     end
 
-    if not success then
-        error(data, 2)
+    assert(type(source) == "string", "Invalid download source")
+
+    local repository, remainder =
+        source:match("^([^@]+)@(.+)$")
+
+    assert(repository and remainder,
+        "Use a direct URL or owner/repository@branch/path")
+
+    local branch, path = remainder:match("^([^/]+)/(.+)$")
+
+    if not branch then
+        branch = remainder
+        path = ""
     end
 
-    module.data = data
-    module.isLoaded = true
+    local url = "https://raw.githubusercontent.com/"
+        .. repository .. "/" .. branch
 
-    return data
+    if path ~= "" then
+        url = url .. "/" .. path
+    end
+
+    return url
 end
 
 --==================================================
--- MODULE SOURCE BUNDLER
+-- DOWNLOAD / CACHE
 --==================================================
 
-local function createOutputStream()
-    local output = {}
+function Suite.download(source, destination, options)
+    options = options or {}
 
-    return {
-        push = function(str)
-            table.insert(output, str)
-        end,
+    assert(type(source) == "string", "Source must be a string")
 
-        concat = function()
-            return table.concat(output)
-        end,
-    }
-end
+    destination = destination or normalizeName(source)
 
-local function registerModule(object, allowRecursion)
-    local id = HttpService:GenerateGUID(false)
+    local path = cachePath(destination)
 
-    local function requireImpl(target)
-        if typeof(target) == "Instance" and modules[target] then
-            return loadModule(target, object, allowRecursion)
+    if options.useCache ~= false then
+        local cached = safeRead(path)
+        if cached then
+            return path
         end
-
-        return require(target)
     end
 
-    modules[object] = {
-        data = nil,
-        fn = nil,
-        isLoaded = false,
-    }
+    local url = resolveUrl(source)
+    local content = httpGet(url)
 
-    idToScript[id] = object
-    scriptToId[object] = id
-    globalMap[id] = {object, requireImpl}
+    assert(type(content) == "string" and #content > 0,
+        "Download returned empty content: " .. url)
 
-    return id
-end
+    if hasFileSystem() then
+        assert(safeWrite(path, content),
+            "Could not write downloaded file: " .. path)
 
-local function pushHeader(stream)
-    stream.push("local modules, globalMap, idToScript = ...\n")
-end
-
-local function pushModule(object, stream, options)
-    if not object:IsA("LocalScript")
-        and not object:IsA("ModuleScript") then
-        return
+        return path
     end
 
-    local id = string.format(
-        "%q",
-        registerModule(object, not options.nocirculardeps)
-    )
-
-    local path = string.format(
-        "%q",
-        "@" .. PROGRAM_NAME .. "." .. object:GetFullName()
-    )
-
-    if options.debug then
-        object.Source =
-            "local script, require = unpack((...)[" .. id .. "]); "
-            .. object.Source
-
-        stream.push(
-            "modules[idToScript[" .. id .. "]].fn = function ()\n"
-                .. "local fn, err = loadstring(idToScript[" .. id .. "].Source, "
-                .. path .. ")\n"
-                .. "return assert(fn, err)(globalMap)\n"
-                .. "end\n"
-        )
-
-        return
-    end
-
-    object.Source =
-        "local script, require = unpack(globalMap[" .. id .. "]); "
-        .. object.Source
-
-    stream.push(
-        "modules[idToScript[" .. id .. "]].fn = function ()\n"
-            .. object.Source
-            .. "\nend\n"
-    )
+    return content
 end
 
-local function initialize(stream)
-    assert(
-        loadstring(stream.concat(), "@" .. PROGRAM_NAME)
-    )(modules, globalMap, idToScript)
+function Suite.clearCache(name)
+    if name then
+        return safeDelete(cachePath(name))
+    end
+
+    if not hasFileSystem() then
+        return false
+    end
+
+    if type(listfiles) ~= "function" then
+        return false
+    end
+
+    local ok, files = pcall(listfiles, CACHE)
+    if not ok or type(files) ~= "table" then
+        return false
+    end
+
+    for _, file in ipairs(files) do
+        pcall(function()
+            if isfile(file) then
+                delfile(file)
+            end
+        end)
+    end
+
+    table.clear(MODULE_CACHE)
+    return true
 end
 
 --==================================================
 -- MODEL LOADING
 --==================================================
 
-local function getObjectsNoCache(url, isVerbose)
-    local assetId = string.match(url, "^rbxassetid://(%d+)$")
-
-    if not assetId then
-        return game:GetObjects(url)
+local function readAsset(path)
+    if type(path) == "string" and isHttpUrl(path) then
+        return httpGet(path)
     end
 
-    local data = HttpService:JSONDecode(
-        httpGet(
-            "https://assetdelivery.roblox.com/v2/assetId/"
-                .. assetId
-        )
-    )
-
-    local location = data.locations and data.locations[1]
-        and data.locations[1].location
-
-    if not location then
-        error("Asset delivery did not return a download location.")
+    local content = safeRead(path)
+    if content then
+        return content
     end
 
-    local rbxmData = httpGet(location)
-
-    if rbxmData == "" then
-        log("Model data was blank; using GetObjects fallback.", isVerbose)
-        return game:GetObjects(url)
+    if type(readfile) == "function" then
+        local ok, result = pcall(readfile, path)
+        if ok and result then
+            return result
+        end
     end
 
-    writefile(PROGRAM_TEMP, rbxmData)
+    error("Could not read model file: " .. tostring(path))
+end
 
-    local success, result = pcall(function()
-        return game:GetObjects(pathToUrl(PROGRAM_TEMP))
-    end)
+local function assetUrl(path)
+    local assetFunction =
+        getcustomasset or getsynasset
 
-    pcall(delfile, PROGRAM_TEMP)
+    assert(type(assetFunction) == "function",
+        "This executor does not support getcustomasset/getsynasset")
 
-    if not success then
-        log("Model load failed: " .. tostring(result), isVerbose)
-        return game:GetObjects(url)
-    end
+    local ok, result = pcall(assetFunction, path)
+
+    assert(ok and type(result) == "string",
+        "Could not create a local asset URL")
 
     return result
 end
 
-local function getObjects(url, options)
-    if string.find(url, "^rbxassetid://") then
-        if options.nocache then
-            return getObjectsNoCache(url, options.verbose)
-        end
-
-        return game:GetObjects(url)
-    end
-
-    return game:GetObjects(pathToUrl(url))
-end
-
-local function hydrate(stream, model, options)
-    pushModule(model, stream, options)
-
-    for _, object in ipairs(model:GetDescendants()) do
-        pushModule(object, stream, options)
-    end
-end
-
---==================================================
--- RUN LOCAL SCRIPTS
---==================================================
-
-local function startScript(object, index, options)
-    local spawnFunction = options.deferred and task.defer or task.spawn
-
-    spawnFunction(function()
-        log(
-            "Running " .. index .. ": " .. object:GetFullName(),
-            options.verbose
-        )
-
-        local success, err = pcall(loadModule, object)
-
-        if not success then
-            warn(
-                "[RBXM Suite] Script "
-                    .. index .. " failed: " .. tostring(err)
-            )
-        else
-            log("Finished script " .. index, options.verbose)
-        end
-    end)
-end
-
-local function startScripts(model, options)
-    local index = 0
-
-    if model:IsA("LocalScript") and not model.Disabled then
-        index += 1
-        startScript(model, index, options)
-    end
-
-    for _, object in ipairs(model:GetDescendants()) do
-        if object:IsA("LocalScript") and not object.Disabled then
-            index += 1
-            startScript(object, index, options)
+local function loadModel(path)
+    -- Some environments expose a direct model loader.
+    if type(loadrbxasset) == "function" then
+        local ok, result = pcall(loadrbxasset, path)
+        if ok and typeof(result) == "Instance" then
+            return result
         end
     end
-end
 
---==================================================
--- OPTIONAL LEGACY VISUAL EFFECTS
---==================================================
+    assert(type(game.GetObjects) == "function",
+        "This environment does not support game:GetObjects()")
 
-local function startLegacyVisualEffects()
-    local Players = game:GetService("Players")
-    local UIS = game:GetService("UserInputService")
-    local RunService = game:GetService("RunService")
-    local Lighting = game:GetService("Lighting")
-
-    local player = Players.LocalPlayer
-    if not player then
-        return
-    end
-
-    local playerGui = player:WaitForChild("PlayerGui")
-
-    local oldGui = playerGui:FindFirstChild("LegacyCursorEffects")
-    if oldGui then
-        oldGui:Destroy()
-    end
-
-    local oldBlur = Lighting:FindFirstChild("LegacyCursorMotionBlur")
-    if oldBlur then
-        oldBlur:Destroy()
-    end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "LegacyCursorEffects"
-    gui.IgnoreGuiInset = true
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 100000
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
-    gui.Parent = playerGui
-
-    pcall(function()
-        UIS.MouseIconEnabled = true
+    local ok, result = pcall(function()
+        return game:GetObjects(assetUrl(path))
     end)
 
-    local blur = Instance.new("BlurEffect")
-    blur.Name = "LegacyCursorMotionBlur"
-    blur.Size = 0
-    blur.Parent = Lighting
+    assert(ok and type(result) == "table" and result[1],
+        "Failed to load the RBXM model. The executor must support "
+        .. "loading local model assets.")
 
-    local count = 8
-    local images = table.create(count)
-    local positions = table.create(count)
-
-    local initial = UIS:GetMouseLocation()
-    local cursor = Vector2.new(initial.X, initial.Y)
-    local lastCursor = cursor
-    local speed = 0
-    local blurSize = 0
-    local usingGamepad = false
-    local alive = true
-
-    for i = 1, count do
-        local image = Instance.new("ImageLabel")
-        image.Name = "CursorTrail" .. i
-        image.BackgroundTransparency = 1
-        image.BorderSizePixel = 0
-        image.Image = "rbxasset://textures/ArrowCursor.png"
-        image.Size = UDim2.fromOffset(24, 24)
-        image.Position = UDim2.fromOffset(cursor.X, cursor.Y)
-        image.ImageTransparency = 1
-        image.Visible = false
-        image.ZIndex = i
-        image.Parent = gui
-
-        images[i] = image
-        positions[i] = cursor
-    end
-
-    local dot = Instance.new("Frame")
-    dot.Name = "GamepadPointer"
-    dot.Size = UDim2.fromOffset(7, 7)
-    dot.AnchorPoint = Vector2.new(0.5, 0.5)
-    dot.BackgroundColor3 = Color3.new(1, 1, 1)
-    dot.BorderSizePixel = 0
-    dot.Visible = false
-    dot.ZIndex = count + 1
-    dot.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(1, 0)
-    corner.Parent = dot
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.new(0, 0, 0)
-    stroke.Thickness = 1
-    stroke.Parent = dot
-
-    local function alpha(rate, dt)
-        return 1 - math.exp(-rate * math.min(dt, 0.05))
-    end
-
-    local function updateInput(inputType)
-        if inputType.Name:match("^Gamepad") then
-            usingGamepad = true
-        elseif inputType == Enum.UserInputType.MouseMovement
-            or inputType == Enum.UserInputType.MouseButton1
-            or inputType == Enum.UserInputType.MouseButton2
-            or inputType == Enum.UserInputType.MouseButton3
-            or inputType == Enum.UserInputType.Touch then
-            usingGamepad = false
-        end
-
-        dot.Visible = usingGamepad
-    end
-
-    local inputConnection = UIS.LastInputTypeChanged:Connect(updateInput)
-    updateInput(UIS:GetLastInputType())
-
-    local renderConnection
-    renderConnection = RunService.RenderStepped:Connect(function(dt)
-        if not alive or not gui.Parent then
-            return
-        end
-
-        dt = math.min(dt, 0.05)
-
-        local mouse = UIS:GetMouseLocation()
-        cursor = Vector2.new(mouse.X, mouse.Y)
-
-        local distance = (cursor - lastCursor).Magnitude
-        local instantSpeed = distance / math.max(dt, 1 / 240)
-
-        speed += (math.min(instantSpeed, 3000) - speed) * alpha(24, dt)
-
-        -- Snapshot positions before updating the trail.
-        for i = count, 2, -1 do
-            positions[i] = positions[i - 1]
-        end
-        positions[1] = cursor
-
-        if usingGamepad then
-            dot.Position = UDim2.fromOffset(cursor.X, cursor.Y)
-        end
-
-        for i = 1, count do
-            local age = (i - 1) / math.max(1, count - 1)
-            local target = positions[i]
-            local image = images[i]
-
-            image.Position = UDim2.fromOffset(target.X, target.Y)
-            image.ImageTransparency = math.clamp(
-                0.28 + age * 0.70,
-                0,
-                1
-            )
-            image.Visible = not usingGamepad and distance > 0.1
-        end
-
-        local targetBlur = 0
-        if not usingGamepad then
-            targetBlur = math.clamp((speed - 650) * 0.002, 0, 3)
-        end
-
-        blurSize += (targetBlur - blurSize) * alpha(24, dt)
-        blur.Size = blurSize
-
-        lastCursor = cursor
-    end)
-
-    gui.Destroying:Connect(function()
-        alive = false
-        renderConnection:Disconnect()
-        inputConnection:Disconnect()
-
-        if blur.Parent then
-            blur:Destroy()
-        end
-    end)
+    return result[1]
 end
 
 --==================================================
--- RBXM SUITE API
+-- SCRIPT / MODULE RESOLUTION
 --==================================================
 
----Loads a model and returns the loaded model instance(s).
----@param url string
----@param opt? Options
----@return Instance[]
-local function launch(url, opt)
-    assert(type(url) == "string", "The first argument 'url' must be a string.")
-    assert(type(opt) == "table" or opt == nil, "The options argument must be a table or nil.")
+local function findModule(root, moduleName)
+    if not root then
+        return nil
+    end
 
-    opt = opt or {}
+    for _, instance in ipairs(root:GetDescendants()) do
+        if instance:IsA("ModuleScript")
+            and instance.Name == moduleName then
+            return instance
+        end
+    end
 
-    local options = {
-        runscripts = useOption(opt.runscripts, true),
-        deferred = useOption(opt.deferred, true),
-        nocache = useOption(opt.nocache, false),
-        nocirculardeps = useOption(opt.nocirculardeps, true),
-        debug = useOption(opt.debug, false),
-        verbose = useOption(opt.verbose, false),
+    return nil
+end
+
+local function makeRequire(root)
+    local customRequire
+
+    customRequire = function(target)
+        if type(target) == "string" then
+            local module = findModule(root, target)
+            assert(module, "Module not found: " .. target)
+            target = module
+        end
+
+        assert(typeof(target) == "Instance"
+            and target:IsA("ModuleScript"),
+            "Suite.require expects a ModuleScript or module name")
+
+        if MODULE_CACHE[target] ~= nil then
+            return MODULE_CACHE[target]
+        end
+
+        local source
+        local okSource, sourceResult = pcall(function()
+            return target.Source
+        end)
+
+        if okSource then
+            source = sourceResult
+        end
+
+        -- Standard require is preferred when available.
+        local ok, result = pcall(require, target)
+        if ok then
+            MODULE_CACHE[target] = result
+            return result
+        end
+
+        -- Source fallback for environments that permit loadstring.
+        if source and type(loadstring) == "function" then
+            local chunk, compileError = loadstring(source,
+                "@" .. target:GetFullName())
+
+            assert(chunk, compileError or "Module compilation failed")
+
+            local environment = setmetatable({
+                script = target,
+                require = customRequire,
+            }, {
+                __index = Env,
+            })
+
+            if type(setfenv) == "function" then
+                pcall(setfenv, chunk, environment)
+            end
+
+            local moduleResult = chunk()
+            MODULE_CACHE[target] = moduleResult
+            return moduleResult
+        end
+
+        error(result)
+    end
+
+    return customRequire
+end
+
+local function prepareModel(model)
+    local descendants = model:GetDescendants()
+
+    for _, instance in ipairs(descendants) do
+        if instance:IsA("BaseScript") then
+            -- Scripts are run explicitly by Suite.launch.
+            instance.Disabled = true
+        end
+    end
+end
+
+--==================================================
+-- LAUNCH
+--==================================================
+
+function Suite.launch(source, options)
+    options = options or {}
+
+    local path = source
+
+    if options.download then
+        path = Suite.download(source, options.destination, {
+            useCache = options.useCache,
+        })
+    elseif isHttpUrl(source) then
+        path = Suite.download(source, options.destination, {
+            useCache = options.useCache,
+        })
+    end
+
+    local model = loadModel(path)
+
+    model.Name = options.name or model.Name or "LoadedRBXM"
+    prepareModel(model)
+
+    local parent = options.parent or game:GetService("CoreGui")
+    model.Parent = parent
+
+    local context = {
+        Model = model,
+        Root = model,
+        Options = options,
+        Require = makeRequire(model),
+        Connections = {},
     }
 
-    log("Launching file '" .. url .. "'", options.verbose)
+    function context:Disconnect()
+        for _, connection in ipairs(self.Connections) do
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
 
-    local started = os.clock()
-    local objects = getObjects(url, options)
-    local stream = createOutputStream()
-
-    pushHeader(stream)
-
-    for _, model in ipairs(objects) do
-        hydrate(stream, model, options)
+        table.clear(self.Connections)
     end
 
-    initialize(stream)
-
     if options.runscripts then
-        for _, model in ipairs(objects) do
-            startScripts(model, options)
+        for _, instance in ipairs(model:GetDescendants()) do
+            if instance:IsA("LocalScript") then
+                local ok, sourceCode = pcall(function()
+                    return instance.Source
+                end)
+
+                if ok and type(sourceCode) == "string"
+                    and type(loadstring) == "function" then
+                    local chunk, compileError = loadstring(
+                        sourceCode,
+                        "@" .. instance:GetFullName()
+                    )
+
+                    if chunk then
+                        local environment = setmetatable({
+                            script = instance,
+                            require = context.Require,
+                            Suite = Suite,
+                        }, {
+                            __index = Env,
+                        })
+
+                        if type(setfenv) == "function" then
+                            pcall(setfenv, chunk, environment)
+                        end
+
+                        local ran, runError = pcall(chunk)
+
+                        if not ran and options.debug then
+                            warn("[RBXM Suite] Script error:",
+                                instance:GetFullName(), runError)
+                        end
+                    elseif options.debug then
+                        warn("[RBXM Suite] Compile error:",
+                            instance:GetFullName(), compileError)
+                    end
+                end
+            end
         end
     end
 
-    if opt.legacyVisualEffects == true then
-        task.defer(function()
-            local success, err = pcall(startLegacyVisualEffects)
+    return context
+end
 
-            if not success then
-                warn("[RBXM Suite] Legacy effects failed:", err)
-            end
-        end)
+function Suite.require(modelOrContext, moduleName)
+    local root = modelOrContext
+
+    if type(modelOrContext) == "table" then
+        root = modelOrContext.Root or modelOrContext.Model
     end
 
-    log(
-        string.format(
-            "Finished in %.2f ms.",
-            (os.clock() - started) * 1000
-        ),
-        options.verbose
-    )
+    assert(typeof(root) == "Instance",
+        "Suite.require expects a model or launch context")
 
-    return unpack(objects)
-end
+    if not moduleName then
+        local module = root:FindFirstChildWhichIsA(
+            "ModuleScript", true
+        )
 
----Runs a registered script or module and returns its result.
-local function requireModule(object)
-    assert(typeof(object) == "Instance", "Expected an Instance.")
-    assert(
-        object:IsA("LuaSourceContainer"),
-        "Expected a LocalScript or ModuleScript."
-    )
-    assert(modules[object], "The script was not registered with RBXM Suite.")
+        assert(module, "No ModuleScript found in model")
 
-    return loadModule(object)
-end
-
----Downloads an asset from a GitHub release.
-local function download(repository, asset)
-    local user, repo, tag = string.match(
-        repository,
-        "([^/]+)/([^@]+)@?(.*)"
-    )
-
-    assert(user and repo, "Invalid repository format.")
-    assert(type(asset) == "string", "The asset must be a string.")
-
-    if tag == "" or tag == nil then
-        tag = "latest"
+        return makeRequire(root)(module)
     end
 
-    return github.download(user, repo, tag, asset)
+    return makeRequire(root)(moduleName)
 end
 
----Clears the downloaded asset cache.
-local function clearCache()
-    return github.clearCache()
+function Suite.useGlobal(name)
+    if name then
+        return Env[name]
+    end
+
+    return Env
 end
 
-return {
-    launch = launch,
-    require = requireModule,
-    download = download,
-    clearCache = clearCache,
-}
+-- Do not create cursor or blur effects here.
+-- The Legacy Branch script owns those effects.
+function Suite.startLegacyVisualEffects()
+    return false
+end
+
+Env.Suite = Suite
+
+return Suite
